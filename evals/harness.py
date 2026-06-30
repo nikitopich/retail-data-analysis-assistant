@@ -134,6 +134,28 @@ def has_creds() -> bool:
     return bool(config.GOOGLE_API_KEY and config.GCP_PROJECT)
 
 
+_tracing_started = False
+
+
+def init_tracing_if_enabled() -> Optional[str]:
+    """Turn on Phoenix tracing for an eval session when ``TRACING=1`` (same trigger
+    as the CLI's ``--trace``). Instrumentation is global, so we do it once per
+    process. Returns the Phoenix URL/endpoint, or ``None`` when disabled/unavailable.
+
+    Prefer an EXTERNAL collector (``phoenix serve`` + ``PHOENIX_COLLECTOR_ENDPOINT``):
+    an embedded ``px.launch_app()`` dies when the (often short) eval process exits,
+    so its traces can't be inspected afterwards.
+    """
+    global _tracing_started
+    if _tracing_started or not config.TRACING:
+        return None
+    from app.observability import init_tracing
+
+    url = init_tracing(True, endpoint=config.PHOENIX_COLLECTOR_ENDPOINT)
+    _tracing_started = True
+    return url
+
+
 # --------------------------------------------------------------------------- #
 # Isolated library DB
 # --------------------------------------------------------------------------- #
@@ -212,7 +234,7 @@ def drive(question: str, *, confirm: Optional[str] = None, debug: bool = False,
           user_id: Optional[str] = None, counters: Optional[dict] = None) -> RunResult:
     """Run ``question`` through the compiled graph; drive the confirm loop.
 
-    ``confirm`` is the answer fed to a destructive ``interrupt()`` (e.g. "да" /
+    ``confirm`` is the answer fed to a destructive ``interrupt()`` (e.g. "yes" /
     "no"); ``None`` means "no confirmation provided" which the gate treats as a
     cancel — exactly like the CLI's AFK default.
     """

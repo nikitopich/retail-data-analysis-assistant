@@ -14,32 +14,31 @@ from app.agents.reports_gate import _is_confirmed, _parse_pick, _target_single_r
 # _is_confirmed — hybrid YES/NO confirmation
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("ans", [
-    "да", "Да", "yes", "Y", "ок", "подтверждаю", "go", " удаляй ",
-    "confirm", "ok",
+    "yes", "Yes", "Y", "ok", "go", "confirm",
 ])
 def test_is_confirmed_yes(ans):
     assert _is_confirmed(ans)
 
 
 @pytest.mark.parametrize("ans", [
-    None, "", "нет", "no", "n", "отмена", "cancel", "stop", "abort",
+    None, "", "no", "n", "cancel", "stop", "abort",
 ])
 def test_is_confirmed_no(ans):
     assert not _is_confirmed(ans)
 
 
 def test_is_confirmed_strips_punctuation():
-    assert _is_confirmed("да!")
+    assert _is_confirmed("yes!")
     assert _is_confirmed("yes.")
-    assert not _is_confirmed("нет!")
+    assert not _is_confirmed("no!")
 
 
 # --------------------------------------------------------------------------- #
 # _parse_pick — interpret user's pick reply
 # --------------------------------------------------------------------------- #
 _ROWS = [
-    {"id": "r1", "question": "Топ клиентов"},
-    {"id": "r2", "question": "Выручка за месяц"},
+    {"id": "r1", "question": "Top customers"},
+    {"id": "r2", "question": "Revenue for the month"},
 ]
 
 
@@ -48,13 +47,13 @@ def test_parse_pick_none_returns_cancel():
 
 
 def test_parse_pick_no_words_return_cancel():
-    assert _parse_pick("нет", _ROWS) == "cancel"
-    assert _parse_pick("отмена", _ROWS) == "cancel"
+    assert _parse_pick("no", _ROWS) == "cancel"
+    assert _parse_pick("cancel", _ROWS) == "cancel"
 
 
 def test_parse_pick_yes_words_return_all():
-    assert _parse_pick("да", _ROWS) == "all"
-    assert _parse_pick("все", _ROWS) == "all"
+    assert _parse_pick("yes", _ROWS) == "all"
+    assert _parse_pick("all", _ROWS) == "all"
 
 
 def test_parse_pick_digit_in_range():

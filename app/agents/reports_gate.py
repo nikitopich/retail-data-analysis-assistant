@@ -23,12 +23,10 @@ from app.tools.sql_tools import preview_guard
 
 # Deterministic floor: an explicit, unambiguous affirmative or negative.
 _YES = {
-    "да", "д", "yes", "y", "ок", "ok", "yeah", "ага", "confirm",
-    "подтверждаю", "подтвердить", "удаляй", "go",
+    "yes", "y", "ok", "yeah", "confirm", "go",
 }
 _NO = {
-    "нет", "н", "no", "n", "отмена", "отменить", "cancel", "stop", "стоп",
-    "не надо", "не нужно", "отставить", "abort",
+    "no", "n", "cancel", "stop", "abort",
 }
 
 _CONFIRM_PROMPT = """A user was asked to confirm an IRREVERSIBLE delete/update of THEIR OWN saved reports.
@@ -73,7 +71,7 @@ Reports:
 User reply: {answer}
 
 Return EXACTLY one token:
-- A number (1, 2, …) matching the report the user refers to — by ordinal word ("первый"/"first"/etc.), by title substring, or by description.
+- A number (1, 2, …) matching the report the user refers to — by ordinal word ("first"/"second"/etc.), by title substring, or by description.
 - "all" if the user wants to update all of them.
 - "cancel" if the user wants to abort or the reply is ambiguous/unclear.
 
@@ -103,7 +101,7 @@ def _llm_pick(answer: str, rows: list) -> str:
         return "cancel"
 
 
-_ALL_WORDS = {"все", "all", "оба", "обе", "всех", "оба варианта"}
+_ALL_WORDS = {"all", "both"}
 
 
 def _parse_pick(answer: str, rows: list) -> str:

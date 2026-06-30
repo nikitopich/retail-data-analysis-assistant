@@ -53,6 +53,11 @@ def main() -> int:
                     help="suppress detailed DeepEval output per metric")
     args = ap.parse_args()
 
+    # Opt-in Phoenix tracing (TRACING=1) — capture every case's graph spans.
+    trace_url = harness.init_tracing_if_enabled()
+    if trace_url:
+        print(f"Phoenix tracing enabled → {trace_url}")
+
     if args.quiet:
         import contextlib
         import io

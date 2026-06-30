@@ -114,7 +114,7 @@ def _persist(question: str, sql_query: str, report_md: str, debug: bool) -> tupl
         report_id = SavedReportsRepo().save(
             config.CURRENT_USER_ID, question, sql_query, report_md
         )
-        return report_id, "\n\n_(report saved to library)_"
+        return report_id, ""
     except Exception as e:  # pragma: no cover
         if debug:
             return "", "\n\n" + errors.format_error("(failed to save report)", True, e)

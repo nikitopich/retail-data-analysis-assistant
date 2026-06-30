@@ -1,415 +1,458 @@
-# Prototype: Retail Data Analysis Assistant (реализация)
+# Prototype: Retail Data Analysis Assistant (implementation)
 
-> Документ описывает **фактически реализованный прототип** и поддерживается в синхроне с кодом.
-> Извлечён из [HLD.md](HLD.md): прототип — это «локальный срез» облачной архитектуры (без Cloud Run,
-> Cloud SQL, pgvector, async-воркеров и UI).
+> This document describes the **actually implemented prototype** and is kept in sync with the code.
+> Extracted from [HLD.md](HLD.md): the prototype is a "local slice" of the cloud architecture (without Cloud Run,
+> Cloud SQL, pgvector, async workers, and UI).
 >
-> Стек: **Python 3.11+ · LangGraph · LangChain (`langchain-google-genai`) · Google Gemini
+> Stack: **Python 3.11+ · LangGraph · LangChain (`langchain-google-genai`) · Google Gemini
 > (2.5-flash-lite / 3.5-flash / 2.5-flash) · BigQuery (read-only) · SQLite · Arize Phoenix
-> (опц. трейсинг) · DeepEval (eval-тесты) · CLI**.
+> (opt. tracing) · DeepEval (eval tests) · CLI**.
 
 ---
 
-## 0. Главное за 30 секунд
+## 0. Summary in 30 seconds
 
-Чат-агент в CLI. Пользователь задаёт вопрос на естественном языке → граф LangGraph:
+A chat agent in CLI. The user asks a question in natural language → LangGraph graph:
 
-1. **Supervisor** (тонкий) классифицирует *поток*: `query` (чтение данных/схемы/библиотеки) ·
-   `destructive` (удаление/изменение отчётов) · `regenerate` (правка прошлого отчёта) ·
-   `feedback_positive` / `info` / `other` (сразу сценарный ответ).
-2. **SQL Agent** для `query` — это **tool-calling агент**: схема BigQuery вшита в системный промпт,
-   модель сама выбирает источник, вызывая инструмент (`run_bigquery_query` для аналитики /
-   `query_saved_reports` для библиотеки) и пишет SQL как **аргумент** инструмента; на структурный
-   вопрос отвечает прямо из схемы без инструмента. Guard'ы — внутри инструментов.
-3. **Report Agent** формирует markdown-отчёт по результату и сохраняет его в локальную библиотеку
-   (SQLite). `regenerate` правит прошлый отчёт без нового запроса.
-4. Для `destructive` SQL-агент генерирует **PREVIEW + ACTION** (DELETE/UPDATE по `saved_reports`);
-   **Reports Gate** показывает превью затронутых записей и **требует подтверждения** (`interrupt()`),
-   затем исполняет операцию, **принудительно ограничив её владельцем**.
-5. Всё устойчиво к ошибкам SQL/пустым ответам/недоступности сервисов — **самокорректируется и не
-   падает**, не раздувая стоимость (жёсткие бюджеты регенераций и backoff; Gemini — fail-fast).
+1. **Supervisor** (thin) classifies the *flow*: `query` (reading data/schema/library) ·
+   `destructive` (deleting/modifying reports) · `regenerate` (editing a previous report) ·
+   `set_preference` (remembering a standing report preference) ·
+   `feedback_positive` / `info` / `other` (immediate scripted response).
+2. **SQL Agent** for `query` — a **tool-calling agent**: BigQuery schema is embedded in the system prompt,
+   the model selects the source itself by calling a tool (`run_bigquery_query` for analytics /
+   `query_saved_reports` for the library) and writes SQL as a **tool argument**; answers structural
+   questions directly from the schema without a tool call. Guards — inside the tools.
+3. **Report Agent** generates a markdown report from the result and saves it to the local library
+   (SQLite). `regenerate` edits the previous report without a new query. Reports honour the user's
+   stored preferences (format/tone/extra) from `user_prefs`.
+4. **Prefs Agent** for `set_preference` — extracts an explicit standing preference from the message,
+   UPSERTs it into `user_prefs`, and re-renders the last shown report so the change is visible immediately
+   (no new library entry, no new query).
+5. For `destructive` the SQL agent generates a **PREVIEW + ACTION** (DELETE/UPDATE on `saved_reports`);
+   **Reports Gate** shows a preview of affected records and **requires confirmation** (`interrupt()`),
+   then executes the operation, **forcibly scoped to the owner**.
+6. Everything is resilient to SQL errors/empty responses/service unavailability — **self-corrects and does not
+   crash**, without inflating cost (hard budgets on regenerations and backoff; Gemini — fail-fast).
 
-LLM-вызовы и узлы графа можно трассировать в **Phoenix** (опционально, флаг `--trace`). **Debug-режим**
-(`--debug`) показывает SQL/ошибки/трейсбэки; в обычном режиме пользователь видит **только сценарные
-сообщения**.
+LLM calls and graph nodes can be traced in **Phoenix** (optional, `--trace` flag). **Debug mode**
+(`--debug`) shows SQL/errors/tracebacks; in normal mode the user only sees **scripted messages**.
 
 ---
 
-## 1. Scope прототипа
+## 1. Prototype scope
 
-### 1.1 Реализуемые требования (выбраны заказчиком: #2 и #3)
+### 1.1 Implemented requirements (selected by customer: #2 and #3)
 
-| # | Требование | Статус |
+| # | Requirement | Status |
 |---|---|---|
-| **High-Stakes Oversight (Destructive Ops)** | Библиотека «Saved Reports» + превью → строгое подтверждение (`interrupt()`) перед DELETE/UPDATE, гибридное подтверждение, удаление только своих отчётов | ✅ реализовано |
-| **Resilience & Graceful Error Handling** | Самокоррекция SQL, обработка пустых ответов, exp-backoff при недоступности BigQuery, fail-fast на Gemini, REPL не падает, без раздувания стоимости | ✅ реализовано |
+| **High-Stakes Oversight (Destructive Ops)** | "Saved Reports" library + preview → strict confirmation (`interrupt()`) before DELETE/UPDATE, hybrid confirmation, delete only own reports | ✅ implemented |
+| **Resilience & Graceful Error Handling** | SQL self-correction, empty response handling, exp-backoff on BigQuery unavailability, fail-fast on Gemini, REPL does not crash, no cost inflation | ✅ implemented |
 
-### 1.2 Базовая функциональность (обязательна по заданию)
+### 1.2 Base functionality (required by assignment)
 
-- Чат-агент, **динамически генерирующий и исполняющий SQL** к `bigquery-public-data.thelook_ecommerce`.
-- Таблицы **читаются живьём** из датасета (`list_tables()` + `get_table_schema()`), список и колонки
-  **не захардкожены**. Основные: `orders`, `order_items`, `products`, `users` (а также
+- Chat agent that **dynamically generates and executes SQL** against `bigquery-public-data.thelook_ecommerce`.
+- Tables are **read live** from the dataset (`list_tables()` + `get_table_schema()`), list and columns
+  are **not hardcoded**. Main ones: `orders`, `order_items`, `products`, `users` (also
   `inventory_items`, `events`, `distribution_centers`).
-- Возможности агента:
-  - поведение клиентов (топ-клиенты, суммарные траты);
-  - перформанс товаров;
-  - метрики по времени (выручка по месяцам, выручка по товарам «на сегодня»);
-  - вопросы про **структуру БД** (какие таблицы/колонки/типы) — ответ из вшитой схемы, без обращения к BigQuery;
-  - **просмотр библиотеки** сохранённых отчётов (список / поиск / показать).
-- Простой **CLI**-интерфейс.
-- Запускается на другой машине по инструкции (Docker не обязателен).
-- Один из **новых Gemini**-моделей (SQL-агент — `gemini-3.5-flash`).
+- Agent capabilities:
+  - customer behavior (top customers, total spending);
+  - product performance;
+  - time-based metrics (monthly revenue, revenue by product "as of today");
+  - questions about **DB structure** (which tables/columns/types) — answered from embedded schema, without querying BigQuery;
+  - **browsing the library** of saved reports (list / search / view).
+- Simple **CLI** interface.
+- Runs on another machine by following instructions (Docker not required).
+- One of the **new Gemini** models (SQL agent — `gemini-3.5-flash`).
 
-### 1.3 Дополнительно реализовано (сверх минимального scope)
+### 1.3 Additionally implemented (beyond minimum scope)
 
-- **`regenerate`** — правка прошлого отчёта («сделай короче», «в виде списка») без нового запроса
-  к BigQuery: предыдущий отчёт и его данные читаются из состояния (сессия делит один thread checkpointer'а).
-- **Гибридное подтверждение** деструктива: детерминированный пол «да/нет» + LLM только на неоднозначном
-  ответе, со смещением в сторону «не подтверждено».
-- **Guard от инъекций на входе** (supervisor): SQL-инъекции (`; DROP`, `--`, `UNION SELECT`),
-  prompt-инъекции (EN/RU: «ignore your rules» / «игнорируй правила»), попытки сослаться на чужую
-  (BigQuery) таблицу в деструктивном запросе.
-- **Отложенный захват троек** (`staged_trios`): тройка `question→sql→report` пишется write-only только
-  при положительном сигнале (явная похвала / пользователь спокойно продолжил / AFK после отчёта).
-- **`feedback_positive` / `info`** интенты — короткие сценарные ответы без обращения к данным.
+- **`regenerate`** — editing a previous report ("make it shorter", "as a list") without a new query
+  to BigQuery: the previous report and its data are read from state (the session shares a single thread checkpointer).
+- **Hybrid confirmation** for destructive ops: deterministic yes/no floor + LLM only for ambiguous
+  replies, biased toward "not confirmed".
+- **Injection guard on input** (supervisor): SQL injections (`; DROP`, `--`, `UNION SELECT`),
+  prompt injections ("ignore your rules"), attempts to reference a BigQuery table in a destructive request.
+- **Deferred trio capture** (`staged_trios`): a `question→sql→report` triple is written write-only only
+  on a positive signal (explicit praise / user calmly continued / AFK after report).
+- **`set_preference`** — explicit standing-preference capture via a dedicated **Prefs Agent**
+  (`app/agents/prefs_agent.py`): extracts `{output_format, tone, extra}` from the message, UPSERTs
+  `user_prefs`, and re-renders the last report. Subsequent reports apply these preferences automatically
+  (synchronous slice of Learning Loop #4 — see §1.4).
+- **`feedback_positive` / `info`** intents — short scripted responses without data access.
 
-### 1.4 Вне scope (НЕ реализовано в прототипе)
+### 1.4 Out of scope (NOT implemented in prototype)
 
-- ❌ **Ретривинг Golden Bucket в query-time** — SQL/Report агенты работают на вшитых промптах + схеме БД,
-  без few-shot из троек. Таблица `trios` определена в DDL, но не читается/не заполняется.
-- ❌ **Evaluator** (LLM-судья, продвижение `staged_trios → trios`). Тройки только захватываются (write-only).
-- ❌ **PII-маскирование** (требование #1 не выбрано). ⚠️ **Known limitation:** агент может вернуть
-  email/имя/адрес из `users`/`orders`. Осознанное допущение; детерминированный маскер описан в HLD §6.2.
-- ❌ Learning Loop как фича (#4): `user_prefs` определяется как таблица и опционально читается Report-агентом
-  (`output_format`), но через диалог не управляется; Prefs Extractor (`app/agents/prefs_extractor.py`) —
-  заглушка под будущий async-воркер.
-- ❌ Persona Management (#8), асинхронные воркеры, Pub/Sub, Cloud-деплой, React UI, аутентификация, стриминг.
+- ❌ **Golden Bucket retrieval at query-time** — SQL/Report agents work on embedded prompts + DB schema,
+  without few-shot from triples. The `trios` table is defined in DDL but is not read/filled.
+- ❌ **Evaluator** (LLM judge, promoting `staged_trios → trios`). Triples are only captured (write-only).
+- ❌ **PII masking** (requirement #1 not selected). ⚠️ **Known limitation:** the agent may return
+  email/name/address from `users`/`orders`. Conscious trade-off; a deterministic masker is described in HLD §6.2.
+- ⚠️ Learning Loop as feature (#4) — **partially implemented**: the **explicit** path works in-dialog
+  (`set_preference` → Prefs Agent UPSERTs `user_prefs`; Report agent reads format/tone/extra and applies
+  them to every report). NOT implemented: the **implicit** path — `prefs_extractor.py`
+  (`app/agents/prefs_extractor.py`) that would infer prefs from dialogue history remains a stub for a
+  future async worker.
+- ❌ Persona Management (#8), async workers, Pub/Sub, Cloud deploy, React UI, authentication, streaming.
 
-### 1.5 Инфраструктура (инструмент, не «закрытое требование»)
+### 1.5 Infrastructure (tooling, not a "closed requirement")
 
-- ✅ **Phoenix трейсинг** всех LLM-вызовов и узлов графа — **opt-in** (`--trace` / `TRACING=1`),
-  поднятие падает мягко (трейсинг — инфраструктура, не требование).
-- ✅ **Debug-режим** показа ошибок (`--debug` / `DEBUG=1`).
+- ✅ **Phoenix tracing** of all LLM calls and graph nodes — **opt-in** (`--trace` / `TRACING=1`),
+  launch failure is soft (tracing is infrastructure, not a requirement).
+- ✅ **Debug mode** for error display (`--debug` / `DEBUG=1`).
 
 ---
 
-## 2. Архитектура прототипа
+## 2. Prototype architecture
 
-### 2.1 Граф LangGraph (`app/graph/build.py`)
+### 2.1 LangGraph graph (`app/graph/build.py`)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Supervisor : вопрос
+    [*] --> Supervisor : question
 
     Supervisor --> SQLAgent : intent = query | destructive
     Supervisor --> ReportAgent : intent = regenerate
-    Supervisor --> [*] : other / feedback_positive / info / inj-guard → сценарное сообщение
+    Supervisor --> PrefsAgent : intent = set_preference
+    Supervisor --> [*] : other / feedback_positive / info / inj-guard → scripted message
 
     state "SQL Agent (tool-calling reads · gated destructive gen)" as SQLAgent
     SQLAgent --> ReportAgent : analytical rows (data_source=analytical)
     SQLAgent --> ReportsGate : destructive DML (DELETE/UPDATE)
-    SQLAgent --> [*] : schema/meta-ответ · NO_DATA · сервис недоступен · ген. не удалась → final_message
+    SQLAgent --> [*] : schema/meta-answer · NO_DATA · service unavailable · gen failed → final_message
 
-    ReportAgent --> [*] : отчёт + сохранение в saved_reports (+ pending_trio)
+    ReportAgent --> [*] : report + saved to saved_reports (+ pending_trio)
+
+    state "Prefs Agent (extract → UPSERT user_prefs → re-render last report)" as PrefsAgent
+    PrefsAgent --> [*] : "✓ Saved your preferences ..." (+ re-rendered report, if any)
 
     state "Reports Gate (preview → interrupt → hybrid confirm → owner-scoped execute)" as ReportsGate
-    ReportsGate --> [*] : "Удалено/Изменено N" · "Операция отменена" · "Под условие не попал ни один отчёт"
+    ReportsGate --> [*] : "Deleted/Updated N" · "Operation cancelled" · "No records matched the condition"
 ```
 
-Маршрутизация:
-- `supervisor` → conditional: `query|destructive → sql_agent`, `regenerate → report_agent`, `other → END`
-  (метки `feedback_positive`/`info`/inj-guard внутри супервайзера сворачиваются в `other` с готовым `final_message`).
-- `sql_agent` → conditional (`_route_after_sql`): если выставлен `final_message` → `END`; если
-  `intent == destructive` → `reports_gate`; если `data_source == schema` → `END`; иначе → `report_agent`.
-- `report_agent`, `reports_gate` → `END`.
+Routing:
+- `supervisor` → conditional: `query|destructive → sql_agent`, `regenerate → report_agent`,
+  `set_preference → prefs_agent`, `other → END`
+  (labels `feedback_positive`/`info`/inj-guard inside supervisor collapse into `other` with a ready `final_message`).
+- `sql_agent` → conditional (`_route_after_sql`): if `final_message` is set → `END`; if
+  `intent == destructive` → `reports_gate`; if `data_source == schema` → `END`; otherwise → `report_agent`.
+- `report_agent`, `reports_gate`, `prefs_agent` → `END`.
 
-**Defense-in-depth:** деструктивный gate срабатывает на **детерминированном глаголе SQL** (`DELETE`/`UPDATE`),
-а не на метке супервайзера — мисклассификация не может пропустить удаление мимо подтверждения.
+**Defense-in-depth:** the destructive gate triggers on the **deterministic SQL verb** (`DELETE`/`UPDATE`),
+not on the supervisor label — a misclassification cannot bypass the deletion confirmation.
 
-### 2.2 Внутренний цикл SQL Agent для `query` — tool-calling (Resilience)
+### 2.2 SQL Agent inner loop for `query` — tool-calling (Resilience)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> System : вопрос + ПОЛНАЯ схема BQ в системном промпте (кэш на сессию)
+    [*] --> System : question + FULL BQ schema in system prompt (cached per session)
 
     System --> LLM
     state LLM <<choice>>
-    LLM --> Direct : нет tool_calls (структурный/мета-ответ из схемы)
-    LLM --> Tool : есть tool_calls
+    LLM --> Direct : no tool_calls (structural/meta answer from schema)
+    LLM --> Tool : has tool_calls
 
     state Tool <<choice>>
     Tool --> RunBQ : run_bigquery_query(sql)
     Tool --> RunReports : query_saved_reports(select_sql)
 
-    RunBQ --> LLM : markdown rows · ERROR ... · NO_DATA ...  (guard + backoff внутри)
-    RunReports --> LLM : markdown rows · ERROR ... · NO_DATA ...  (preview_guard + owner-scope внутри)
+    RunBQ --> LLM : markdown rows · ERROR ... · NO_DATA ...  (guard + backoff inside)
+    RunReports --> LLM : markdown rows · ERROR ... · NO_DATA ...  (preview_guard + owner-scope inside)
 
     Direct --> [*] : data_source=schema → final_message → END
-    LLM --> [*] : бюджет ходов исчерпан (MAX_SQL_ATTEMPTS+1)
+    LLM --> [*] : move budget exhausted (MAX_SQL_ATTEMPTS+1)
 ```
 
-- **Schema** инжектируется в системный промпт один раз за сессию (`lru_cache` в `app/tools/schema.py`
-  + перенос `schema_text` в state), поэтому модели почти никогда не нужен tool `fetch_bq_schema`.
-- **Guard'ы внутри инструментов** (детерминированно, до исполнения): `select_only_guard` (только один
-  SELECT/WITH; запрет DML/DDL/`;`/комментариев), `preview_guard` (SELECT строго по `saved_reports`).
-- **Самокоррекция** — инструмент возвращает строку `ERROR: ...`/`NO_DATA: ...`; модель исправляет SQL и
-  вызывает инструмент снова **в пределах бюджета ходов** (`MAX_SQL_ATTEMPTS + 1`). Это и есть защита от
-  раздувания стоимости — число LLM-перегенераций жёстко ограничено.
-- **Backoff** при недоступности BigQuery — внутри `run_with_backoff` (`1→2→4→8→16s`, ≤ 5 ретраев),
-  **независимый бюджет** от регенераций.
+- **Schema** is injected into the system prompt once per session (`lru_cache` in `app/tools/schema.py`
+  + transfer of `schema_text` to state), so the model almost never needs the `fetch_bq_schema` tool.
+- **Guards inside tools** (deterministically, before execution): `select_only_guard` (only one
+  SELECT/WITH; prohibits DML/DDL/`;`/comments), `preview_guard` (SELECT strictly on `saved_reports`).
+- **Self-correction** — the tool returns `ERROR: ...`/`NO_DATA: ...`; the model fixes the SQL and
+  calls the tool again **within the move budget** (`MAX_SQL_ATTEMPTS + 1`). This is the protection against
+  cost inflation — the number of LLM regenerations is strictly capped.
+- **Backoff** on BigQuery unavailability — inside `run_with_backoff` (`1→2→4→8→16s`, ≤ 5 retries),
+  **independent budget** from regenerations.
 
-Для `destructive` SQL-агент работает не tool-calling-циклом, а как **gated-генератор** (см. §4):
-выдаёт две строки `PREVIEW:`/`ACTION:`, валидирует `dml_guard`, перегенерирует при reject (≤ 3).
+For `destructive` the SQL agent works not as a tool-calling loop but as a **gated generator** (see §4):
+outputs two lines `PREVIEW:`/`ACTION:`, validates `dml_guard`, regenerates on reject (≤ 3).
 
-### 2.3 Карта файлов проекта
+### 2.3 Project file map
 
 ```
 retail-data-analysis-assistant/
-├── main.py                     # точка входа → app.cli:main
+├── main.py                     # entry point → app.cli:main
 ├── requirements.txt
-├── pytest.ini                  # unit-набор по умолчанию = tests/
+├── pytest.ini                  # unit suite default = tests/
 ├── .env.example
-├── README.md                   # краткий запуск + прогон evals
+├── README.md                   # quick start + eval run
 ├── Prototype.md / HLD.md / Eval-Dataset.md
 └── app/
-    ├── config.py               # env, модели, лимиты, бюджеты, пути, validate_required()
-    ├── llm.py                  # фабрика ChatGoogleGenerativeAI (lru_cache) + llm_text() нормализация
-    ├── retry.py                # retry_with_backoff — переиспользуемый exp-backoff декоратор
-    ├── errors.py               # таксономия ошибок, классификаторы BQ/LLM, сценарные сообщения, format_*
-    ├── observability.py        # Phoenix init (opt-in, мягкий)
-    ├── cli.py                  # REPL, флаги --debug/--trace, resume-цикл подтверждения, AFK троек
+    ├── config.py               # env, models, limits, budgets, paths, validate_required()
+    ├── llm.py                  # ChatGoogleGenerativeAI factory (lru_cache) + llm_text() normalization
+    ├── retry.py                # retry_with_backoff — reusable exp-backoff decorator
+    ├── errors.py               # error taxonomy, BQ/LLM classifiers, scripted messages, format_*
+    ├── observability.py        # Phoenix init (opt-in, soft)
+    ├── cli.py                  # REPL, --debug/--trace flags, confirmation resume loop, AFK trios
     ├── graph/
     │   ├── state.py            # AgentState (TypedDict)
-    │   └── build.py            # сборка StateGraph + routers + checkpointer (SqliteSaver)
-    ├── agents/                 # узлы графа (промпты живут здесь, рядом с узлом)
-    │   ├── supervisor.py       # тонкая классификация intent + input-guard от инъекций + flush троек
-    │   ├── sql_agent.py        # tool-calling для чтения · gated-генерация для деструктива
-    │   ├── report_agent.py     # генерация отчёта + сохранение · ветка regenerate
-    │   ├── reports_gate.py     # preview → interrupt → гибридное подтверждение → owner-scoped execute
-    │   └── prefs_extractor.py  # заглушка под будущий async-воркер (NotImplemented)
-    ├── tools/                  # детерминированные инструменты — без промптов, без LLM
+    │   └── build.py            # StateGraph assembly + routers + checkpointer (SqliteSaver)
+    ├── agents/                 # graph nodes (prompts live here, next to the node)
+    │   ├── supervisor.py       # thin intent classification + input injection guard + trio flush
+    │   ├── sql_agent.py        # tool-calling for reads · gated generation for destructive
+    │   ├── report_agent.py     # report generation + saving · regenerate branch
+    │   ├── reports_gate.py     # preview → interrupt → hybrid confirmation → owner-scoped execute
+    │   ├── prefs_agent.py      # set_preference: extract → UPSERT user_prefs → re-render last report
+    │   └── prefs_extractor.py  # stub for future async (IMPLICIT) prefs worker (NotImplemented)
+    ├── tools/                  # deterministic tools — no prompts, no LLM
     │   ├── query_tools.py      # @tool run_bigquery_query / query_saved_reports / fetch_bq_schema
-    │   ├── sql_tools.py        # guard'ы (select/preview/dml/reports), run_with_backoff, df_to_markdown
+    │   ├── sql_tools.py        # guards (select/preview/dml/reports), run_with_backoff, df_to_markdown
     │   ├── reports.py          # parse PREVIEW/ACTION, make_preview_sql, format_rows
-    │   └── schema.py           # интроспекция схемы BQ (lru_cache)
-    └── sources/                # доступ к данным
-        ├── bigquery.py         # BigQueryRunner (дан заказчиком) + cost-guard + lazy singleton
-        ├── db.py               # SQLite DDL/init_db, кэш-коннекшн, get_table_schema_text
+    │   └── schema.py           # BQ schema introspection (lru_cache)
+    └── sources/                # data access
+        ├── bigquery.py         # BigQueryRunner (provided by customer) + cost-guard + lazy singleton
+        ├── db.py               # SQLite DDL/init_db, cached connection, get_table_schema_text
         ├── reports_repo.py     # SavedReportsRepo (owner-scoping!), StagedTriosRepo, flush_pending_trio
-        └── prefs_repo.py       # UserPrefsRepo.get_output_format
-└── evals/                      # DeepEval-набор (см. §13)
-└── tests/                      # детерминированный unit-набор (169 тестов, без сети)
+        └── prefs_repo.py       # UserPrefsRepo: get_prefs / get_output_format / upsert_prefs (read-merge-write)
+└── evals/                      # DeepEval suite (see §13)
+└── tests/                      # deterministic unit suite (178 tests, no network)
 ```
 
 ---
 
-## 3. Компоненты
+## 3. Components
 
 ### 3.1 CLI (`app/cli.py`)
 
-- Простой REPL: читает строку, прогоняет через граф, печатает `final_message`; печатает `[intent: ...]`.
-- Команды: обычный текст = вопрос; `exit`/`quit`/`выход` — выход.
-- Флаги: `--debug` или `DEBUG=1` — debug-режим (§8); `--trace` или `TRACING=1` — Phoenix-трейсинг (§7.3).
-- **Один `thread_id` на всю сессию** (генерируется при старте) — state переживает ходы, что нужно для
-  `regenerate` и для `interrupt()/resume()` деструктива. Per-turn управляющие поля чистятся в супервайзере.
-- **Confirmation-flow:** при `interrupt()` (деструктив) CLI печатает превью затронутых записей и спрашивает
-  подтверждение; ответ пользователя передаётся в `app.invoke(Command(resume=answer), run_config)` —
-  возобновляется тот же thread. Запрос подтверждения **блокирующий** (`input()`).
-- **AFK после отчёта:** когда есть `pending_trio`, следующий ввод читается с таймаутом
-  `TRIO_AFK_TIMEOUT_S` (по умолч. 300 с) — при простое тройка считается «одобренной» и пишется в
-  `staged_trios`. *(Константа `AFK_TIMEOUT_S=30` зарезервирована под авто-отмену подтверждения; в текущем
-  CLI сам запрос подтверждения блокирующий.)*
-- `init_db()` вызывается автоматически на старте — отдельного шага инициализации БД не требуется.
-- REPL обёрнут в `try/except`: любая непойманная ошибка превращается в сценарное сообщение, цикл живёт (§5.4).
+- Simple REPL: reads a line, runs it through the graph, prints `final_message`; prints `[intent: ...]`.
+- Commands: regular text = question; `exit`/`quit` — exit.
+- Flags: `--debug` or `DEBUG=1` — debug mode (§8); `--trace` or `TRACING=1` — Phoenix tracing (§7.3).
+- **One `thread_id` for the entire session** (generated at startup) — state survives turns, needed for
+  `regenerate` and for `interrupt()/resume()` in destructive ops. Per-turn control fields are cleared in the supervisor.
+- **Confirmation flow:** on `interrupt()` (destructive) the CLI prints a preview of affected records and asks
+  for confirmation; the user's answer is passed to `app.invoke(Command(resume=answer), run_config)` —
+  resuming the same thread. The confirmation request is **blocking** (`input()`).
+- **AFK after report:** when `pending_trio` exists, the next input is read with a timeout
+  `TRIO_AFK_TIMEOUT_S` (default 300 s) — on idle the triple is considered "approved" and written to
+  `staged_trios`. *(Constant `AFK_TIMEOUT_S=30` is reserved for auto-cancel of confirmation; in the current
+  CLI the confirmation request itself is blocking.)*
+- `init_db()` is called automatically at startup — no separate DB initialization step is required.
+- REPL is wrapped in `try/except`: any uncaught error becomes a scripted message, the loop lives on (§5.4).
 
 ### 3.2 Supervisor (`app/agents/supervisor.py`)
 
-- Модель: **`gemini-2.5-flash-lite`** (быстрая классификация).
-- **Тонкий**: решает только *поток*. Источник данных для `query` (analytical / schema / reports) выбирает
-  ниже сам SQL-агент.
-- Метки: `query` · `destructive` · `regenerate` · `feedback_positive` · `info` · `other`.
-  `feedback_positive` («спасибо», «отлично») и `info` («к каким данным у тебя доступ») сворачиваются в
-  `other`-маршрут с готовым сообщением.
-- **Input-guard от инъекций** (`_INJECTION_RE`, только при `intent == destructive`): SQL-инъекции,
-  prompt-инъекции (EN/RU), ссылки на защищённые BigQuery-таблицы → отказ с предупреждением, SQL-агент не вызывается.
-- **Flush троек**: `pending_trio` из прошлого хода → `regenerate` отбрасывает (правка ≠ одобрение),
-  `feedback_positive` и любой другой интент → пишут тройку в `staged_trios`.
-- Строгий вывод: одно слово из множества; при нераспознанном — `other`. Ошибка LLM → `other` + сценарное.
+- Model: **`gemini-2.5-flash-lite`** (fast classification).
+- **Thin**: decides only the *flow*. The data source for `query` (analytical / schema / reports) is chosen
+  downstream by the SQL agent itself.
+- Labels: `query` · `destructive` · `regenerate` · `set_preference` · `feedback_positive` · `info` · `other`.
+  `feedback_positive` ("thanks", "great") and `info` ("what data can you access") collapse into
+  the `other` route with a ready-made message; `set_preference` ("always send reports as CSV",
+  "from now on keep it short") routes to the Prefs Agent (§3.5). A tie-break in the prompt biases
+  format/length/tone/style "from now on / always / by default / remember" wording toward `set_preference`
+  (over `regenerate`/`other`).
+- **Input injection guard** (`_INJECTION_RE`, only when `intent == destructive`): SQL injections,
+  prompt injections, references to protected BigQuery tables → rejection with a warning, SQL agent is not called.
+- **Trio flush**: `pending_trio` from the previous turn → `regenerate` and `set_preference` discard
+  (editing / changing settings ≠ approval), `feedback_positive` and any other intent → write the triple
+  to `staged_trios`.
+- Strict output: one word from the set; on unrecognized — `other`. LLM error → `other` + scripted message.
 
 ### 3.3 SQL Agent (`app/agents/sql_agent.py`)
 
-- Модель: **`gemini-3.5-flash`** (новейшая; `llm_text()` нормализует content-блоки Gemini 3.x).
-- **Чтение (`query`)** — tool-calling цикл (§2.2): bind `[run_bigquery_query, query_saved_reports]`,
-  схема в системном промпте, цикл до `MAX_SQL_ATTEMPTS + 1` ходов. Приоритет исхода:
-  успешные данные > данные с ошибкой (`NO_DATA`/недоступность/`SQL_GEN_FAILED`) > прямой ответ
-  (структурный, `data_source=schema`) > ничего. Источник определяется выбранным инструментом
-  (`SOURCE_BY_TOOL`) и кладётся в `data_source`.
-- **Деструктив (`destructive`)** — gated-генерация (§4): два-строчный вывод `PREVIEW:`/`ACTION:` →
-  `parse_reports_output` → `dml_guard`; reject → перегенерация с hint'ом (≤ 3). Исполнение здесь **не делается**.
-- Диалект BigQuery: Standard SQL, полные имена `` `bigquery-public-data.thelook_ecommerce.<table>` ``.
-  Исполнение — через `BigQueryRunner.execute_query()` с cost-guard `maximum_bytes_billed` (§7.1).
-- DataFrame → компактная markdown-таблица (`df_to_markdown`), обрезается до `LLM_ROWS_LIMIT` (100) строк.
+- Model: **`gemini-3.5-flash`** (latest; `llm_text()` normalizes Gemini 3.x content blocks).
+- **Read (`query`)** — tool-calling loop (§2.2): bind `[run_bigquery_query, query_saved_reports]`,
+  schema in system prompt, loop up to `MAX_SQL_ATTEMPTS + 1` moves. Outcome priority:
+  successful data > data with error (`NO_DATA`/unavailability/`SQL_GEN_FAILED`) > direct answer
+  (structural, `data_source=schema`) > nothing. Source is determined by the chosen tool
+  (`SOURCE_BY_TOOL`) and placed in `data_source`.
+- **Destructive (`destructive`)** — gated generation (§4): two-line output `PREVIEW:`/`ACTION:` →
+  `parse_reports_output` → `dml_guard`; reject → regeneration with hint (≤ 3). Execution is **not done here**.
+- BigQuery dialect: Standard SQL, full names `` `bigquery-public-data.thelook_ecommerce.<table>` ``.
+  Execution — via `BigQueryRunner.execute_query()` with cost-guard `maximum_bytes_billed` (§7.1).
+- DataFrame → compact markdown table (`df_to_markdown`), truncated to `LLM_ROWS_LIMIT` (100) rows.
 
 ### 3.4 Report Agent (`app/agents/report_agent.py`)
 
-- Модель: **`gemini-2.5-flash`** (temperature 0.3).
-- **Normal:** вход = вопрос + результат SQL (`rows_markdown`). Выход — markdown-отчёт: подписи колонок,
-  единицы (валюта для revenue/amount/price, счётчики для qty, `%` для процентов), нумерация для топ-N.
-  По умолчанию язык — английский; переключается на язык вопроса. Формат читается из `user_prefs.output_format`
-  (по умолчанию `table`).
-- **Regenerate:** правит прошлый отчёт под коррекцию пользователя; числа — только из сохранённых `rows_markdown`,
-  нового запроса нет. Оригинальный вопрос берётся из `last_question`.
-- После генерации — **сохранение** в `saved_reports` (`SavedReportsRepo.save`), к ответу добавляется пометка
-  `_(отчёт сохранён в библиотеку)_`. Данные тройки кладутся в `pending_trio` (отложенный захват, см. §3.2).
+- Model: **`gemini-2.5-flash`** (temperature 0.3).
+- **Normal:** input = question + SQL result (`rows_markdown`). Output — markdown report: column labels,
+  units (currency for revenue/amount/price, counters for qty, `%` for percentages), numbering for top-N.
+  Default language — English; switches to the question's language. **User preferences** (`output_format`
+  / `tone_preference` / `extra_prefs`) are read via `UserPrefsRepo.get_prefs` and injected as a
+  `_prefs_clause` (non-default prefs only; defaults to `table` and clean prompt on any failure).
+- **Regenerate:** edits the previous report under the user's correction; numbers — only from saved `rows_markdown`,
+  no new query. Original question taken from `last_question`. The renderer (`revise()`) is **shared** with
+  the Prefs Agent's re-render path and also honours the stored preferences.
+- After generation — **saving** to `saved_reports` (`SavedReportsRepo.save`), response appended with
+  `_(report saved to library)_`. Triple data placed in `pending_trio` (deferred capture, see §3.2).
 
-### 3.5 Reports Gate (`app/agents/reports_gate.py`)
+### 3.5 Prefs Agent (`app/agents/prefs_agent.py`)
 
-Ядро High-Stakes Oversight — см. §4.
+- Model: **`gemini-2.5-flash-lite`** (same as supervisor — cheap extraction).
+- Reached only for `set_preference`. Steps:
+  1. **Extract** — `_EXTRACT_PROMPT` asks for a compact JSON `{output_format, tone, extra}`; tolerant
+     parsing strips code fences/prose, each field normalized to a non-empty string or `None`. If nothing
+     concrete is expressed → `PREFS_NOT_UNDERSTOOD` (scripted).
+  2. **Persist** — `UserPrefsRepo.upsert_prefs(...)` does a read-merge-write UPSERT (only non-`None`
+     fields overwrite; others kept). A transient SQLite outage → `SERVICE_UNAVAILABLE`.
+  3. **Re-render** — if a report was already shown this session (`report_md` present), re-render it with
+     the new prefs via the shared `revise()` (using `last_question` + saved `rows_markdown`) so the change
+     is **visible immediately**. A pure preference change does **not** create a new library entry or a
+     `pending_trio`. If re-render fails, the preference is still saved (confirmation + "will apply to your
+     next report").
+- Output: `✓ Saved your preferences: format — …; tone — …` (+ the re-rendered report when applicable).
+- Distinct from `prefs_extractor.py` (the async *implicit* worker, still a stub): this path is explicit
+  and runs inline in the graph.
 
-### 3.6 Инструменты (`app/tools/`)
+### 3.6 Reports Gate (`app/agents/reports_gate.py`)
 
-- `query_tools.py` — `@tool`-функции, которые SQL-агент биндит к LLM. Детерминированные, guard до исполнения,
-  возвращают строку (`ERROR:`/`NO_DATA:` модель читает и исправляется). `fetch_bq_schema` существует, но
-  **не биндится** (схема и так в промпте).
-- `sql_tools.py` — guard'ы (`select_only_guard`, `preview_guard`, `dml_guard`, `reports_sql_guard`),
-  `run_with_backoff` (exp-backoff поверх `BigQueryRunner`), `df_to_markdown`, `strip_sql`.
-- `reports.py` — `parse_reports_output` (PREVIEW/ACTION), `make_preview_sql` (fallback-превью из DML),
-  `format_rows` (markdown библиотеки).
-- `schema.py` — `get_bq_tables` / `get_schema_text` (живая интроспекция, `lru_cache`).
+Core of High-Stakes Oversight — see §4.
 
-### 3.7 Хранилище SQLite (`app/sources/`)
+### 3.7 Tools (`app/tools/`)
 
-- Один файл БД (`DB_PATH`, по умолчанию `agentic.db`). `init_db()` — idempotent `CREATE TABLE IF NOT EXISTS` (§10).
-- **LangGraph checkpointer** — `SqliteSaver` на отдельном файле `checkpoints.db` (нужен для `interrupt()/resume()`).
-- Репозитории инкапсулируют доступ; критическое свойство безопасности — **`SavedReportsRepo` всегда инжектит
-  `owner_id` в коде** (`preview` / `run_select` / `execute_destructive`), никогда не из LLM (§4).
-- `StagedTriosRepo` — write-only захват троек. `UserPrefsRepo` — опциональное чтение `output_format`.
+- `query_tools.py` — `@tool` functions that the SQL agent binds to LLM. Deterministic, guard before execution,
+  return a string (`ERROR:`/`NO_DATA:` the model reads and corrects). `fetch_bq_schema` exists but
+  **is not bound** (schema is already in the prompt).
+- `sql_tools.py` — guards (`select_only_guard`, `preview_guard`, `dml_guard`, `reports_sql_guard`),
+  `run_with_backoff` (exp-backoff over `BigQueryRunner`), `df_to_markdown`, `strip_sql`.
+- `reports.py` — `parse_reports_output` (PREVIEW/ACTION), `make_preview_sql` (fallback preview from DML),
+  `format_rows` (library markdown).
+- `schema.py` — `get_bq_tables` / `get_schema_text` (live introspection, `lru_cache`).
+
+### 3.8 SQLite storage (`app/sources/`)
+
+- Single DB file (`DB_PATH`, default `agentic.db`). `init_db()` — idempotent `CREATE TABLE IF NOT EXISTS` (§10).
+- **LangGraph checkpointer** — `SqliteSaver` on a separate `checkpoints.db` file (needed for `interrupt()/resume()`).
+- Repositories encapsulate access; critical security property — **`SavedReportsRepo` always injects
+  `owner_id` in code** (`preview` / `run_select` / `execute_destructive`), never from LLM (§4).
+- `StagedTriosRepo` — write-only triple capture. `UserPrefsRepo` — reads (`get_prefs`/`get_output_format`)
+  and writes (`upsert_prefs`, read-merge-write UPSERT) the per-user `user_prefs` row.
 
 ---
 
-## 4. Требование #2 — High-Stakes Oversight (Destructive Ops)
+## 4. Requirement #2 — High-Stakes Oversight (Destructive Ops)
 
-**Задача:** «Удали все мои отчёты за сегодня» / «Удали отчёты про клиента X» / «Переименуй отчёт …» с
-обязательным подтверждением, пользователь затрагивает **только свои** отчёты, UX не ломается.
+**Task:** "Delete all my reports from today" / "Delete reports about client X" / "Rename report …" with
+mandatory confirmation, user only affects **their own** reports, UX is not broken.
 
-### 4.1 Поток
+### 4.1 Flow
 
 ```
-Пользователь: "Удали все мои отчёты за сегодня"
+User: "Delete all my reports from today"
 
-→ [Supervisor] intent = destructive  (+ input-guard от инъекций; при срабатывании — отказ на входе)
+→ [Supervisor] intent = destructive  (+ input injection guard; on trigger — rejection at the gate)
 
-→ [SQL Agent · destructive] два артефакта (вывод PREVIEW:/ACTION:):
+→ [SQL Agent · destructive] two artifacts (PREVIEW:/ACTION: output):
    PREVIEW: SELECT id, question, created_at FROM saved_reports WHERE date(created_at) = date('now')
    ACTION:  DELETE FROM saved_reports WHERE date(created_at) = date('now')
-   (UPDATE — для переименования/изменения; SET только question | report_md | published_to_golden)
+   (UPDATE — for renaming/modifying; SET only question | report_md | published_to_golden)
 
-→ [dml_guard] детерминированно (НЕ LLM):
-   ├─ ровно один statement ∈ {DELETE, UPDATE}?               иначе reject
-   ├─ целевая таблица == saved_reports?                      иначе reject
-   ├─ нет DDL/INSERT/MERGE/`;`/комментариев?                 иначе reject
-   └─ reject → перегенерация (attempt < 3) → иначе REPORTS_GEN_FAILED
+→ [dml_guard] deterministically (NOT LLM):
+   ├─ exactly one statement ∈ {DELETE, UPDATE}?               otherwise reject
+   ├─ target table == saved_reports?                          otherwise reject
+   ├─ no DDL/INSERT/MERGE/`;`/comments?                      otherwise reject
+   └─ reject → regeneration (attempt < 3) → otherwise REPORTS_GEN_FAILED
 
 → [Reports Gate]
-   ├─ preview_sql (от агента, если прошёл preview_guard; иначе derive из DML) → preview_guard
-   ├─ SavedReportsRepo.preview(preview_sql, owner_id)   ← owner_id инжектится в коде
-   ├─ пусто (0 строк) → "Под условие не попал ни один отчёт"  (НЕ уходим в interrupt)
-   ├─ interrupt({verb, count, preview_rows, dml_sql}) — граф заморожен, ждёт ответа
+   ├─ preview_sql (from agent, if passed preview_guard; otherwise derived from DML) → preview_guard
+   ├─ SavedReportsRepo.preview(preview_sql, owner_id)   ← owner_id injected in code
+   ├─ empty (0 rows) → "No records matched the condition"  (do NOT go to interrupt)
+   ├─ interrupt({verb, count, preview_rows, dml_sql}) — graph frozen, waiting for answer
    └─ resume:
-       DELETE → _is_confirmed(answer): гибридное (да/нет пол + LLM на неоднозначном, biased to NO)
-       UPDATE → _parse_pick(answer): cancel | all | номер (можно сузить UPDATE до одной строки)
+       DELETE → _is_confirmed(answer): hybrid (yes/no floor + LLM on ambiguous, biased to NO)
+       UPDATE → _parse_pick(answer): cancel | all | number (can narrow UPDATE to one row)
 
-→ "нет"/cancel → "Операция отменена"
-→ "да"/all/номер → SavedReportsRepo.execute_destructive(dml, owner_id)
-                   → репозиторий ПРИНУДИТЕЛЬНО добавляет "AND owner_id = ?" → "✓ Удалено/Изменено N"
+→ "no"/cancel → "Operation cancelled"
+→ "yes"/all/number → SavedReportsRepo.execute_destructive(dml, owner_id)
+                   → repository FORCIBLY appends "AND owner_id = ?" → "✓ Deleted/Updated N"
 ```
 
-### 4.2 Два независимых рубежа защиты
+### 4.2 Two independent defense layers
 
-1. **`dml_guard`** ограничивает *тип и цель*: только `DELETE`/`UPDATE`, только по `saved_reports`,
-   без DDL/множественных стейтментов/комментариев.
-2. **Репозиторий** ограничивает *область*: всегда добавляет `AND owner_id = ?`. `owner_id` берётся из
-   конфига (`CURRENT_USER_ID`), **никогда** из LLM. Даже при удачной prompt-инъекции чужие отчёты недостижимы.
+1. **`dml_guard`** restricts *type and target*: only `DELETE`/`UPDATE`, only on `saved_reports`,
+   no DDL/multiple statements/comments.
+2. **Repository** restricts *scope*: always appends `AND owner_id = ?`. `owner_id` taken from
+   config (`CURRENT_USER_ID`), **never** from LLM. Even on a successful prompt injection, other users' reports are unreachable.
 
-Плюс **третий рубеж на входе** — supervisor режет явные инъекции до SQL-агента, и **четвёртый**: gate
-срабатывает на детерминированном глаголе SQL, а не на метке супервайзера.
+Plus a **third layer at the input** — supervisor cuts explicit injections before the SQL agent, and a **fourth**: the gate
+triggers on the deterministic SQL verb, not on the supervisor label.
 
-### 4.3 Детали реализации
+### 4.3 Implementation details
 
-- `CURRENT_USER_ID` — из env `CURRENT_USER` (по умолчанию `default_user`). Прототип однопользовательский,
-  но owner-scoping обязателен.
-- Превью обязательно показывает, **что именно** будет затронуто (id/вопрос/время) и число записей.
-- Пустое превью (0 записей) — `PREVIEW_EMPTY`, без `interrupt()`.
-- Гибридное подтверждение: явные «да»/«нет» обрабатываются детерминированно; всё неоднозначное идёт в LLM,
-  смещённый к «не подтверждено» (ошибка/недоступность LLM → не подтверждено — никогда не удаляем на сомнении).
-- «за сегодня» → `date(created_at) = date('now')` (диалект SQLite).
-- ⚠️ **Known gap (отложено):** `_inject_owner_scope` дописывает предикат конкатенацией строки — без скобок
-  вокруг существующего `WHERE` и без учёта хвостового `ORDER BY/LIMIT`. На SQL с `OR` в `WHERE` это может
-  ослабить scoping. Зафиксировано в docstring `reports_repo.py` и закреплено xfail-тестами (memory:
-  `owner-scope-security-gap`). Для прототипа (однопользовательский, guard режет `OR`-побочку лишь частично)
-  — приемлемо; на исправление — параметризованный rewrite WHERE.
-
----
-
-## 5. Требование #3 — Resilience & Graceful Error Handling
-
-### 5.1 Guards (детерминированные, `app/tools/sql_tools.py`)
-
-- **`select_only_guard`** (BigQuery): нормализует SQL, требует единственный `SELECT`/`WITH ... SELECT`;
-  запрещает `INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/TRUNCATE/MERGE/...`, `;` и комментарии. Reject → инструмент
-  возвращает `ERROR:` → перегенерация.
-- **`preview_guard`** — SELECT строго по `saved_reports` (превью деструктива и чтение библиотеки).
-- **`dml_guard`** — ровно один `DELETE`/`UPDATE` по `saved_reports`, без DDL/`;`/комментариев (см. §4).
-
-### 5.2 Retry / self-correction политика
-
-| Ситуация | Поведение | Лимит |
-|---|---|---|
-| SQL не прошёл guard / синтаксис / неверная колонка | инструмент → `ERROR: ...`; модель чинит SQL и зовёт инструмент снова | ходов ≤ `MAX_SQL_ATTEMPTS+1` |
-| Запрос вернул 0 строк | инструмент → `NO_DATA: ...`; модель может **один раз** расширить фильтры (мягко, в рамках бюджета ходов) | в рамках бюджета |
-| Исчерпан бюджет ходов SQL | сценарное: «Не удалось сформировать запрос, переформулируйте вопрос» (`SQL_GEN_FAILED`) | — |
-| Результат всё ещё пуст | сценарное: «По вашему запросу данных нет» (`NO_DATA`) | — |
-| BigQuery недоступен (5xx/timeout/connection) | exponential backoff `1→2→4→8→16s` в `run_with_backoff` | retry ≤ 5 |
-| Backoff исчерпан | сценарное: «Сервис временно недоступен, попробуйте позже» (`SERVICE_UNAVAILABLE`) | — |
-| Gemini 429 / quota / overload | **без ретраев** (`LLM_MAX_RETRIES=1`), сразу `LLM_UNAVAILABLE` | 1 |
-| Gemini 5xx / транзиентная недоступность | **без app-ретраев** (fail-fast), `SERVICE_UNAVAILABLE` | 1 |
-| Деструктив: `dml_guard` reject | перегенерация с указанием причины | attempt ≤ 3 |
-| Деструктив: бюджет исчерпан | сценарное: `REPORTS_GEN_FAILED` | — |
-| SQLite «database is locked» / not ready | backoff (тот же декоратор, `is_retryable_sqlite`) | retry ≤ 5 |
-| Любая неожиданная ошибка | поймать, сценарное `UNEXPECTED`; в debug — трейсбэк | — |
-
-### 5.3 Анти-инфляция стоимости
-
-- Жёсткие бюджеты: регенерации ≤ 3, backoff ≤ 5 — модель не зацикливается.
-- `maximum_bytes_billed` на каждый BigQuery-запрос (§7.1) + дефолтный `LIMIT` для row-listing (через промпт);
-  для агрегатов LIMIT не навязывается (исказил бы результат) — защита здесь `maximum_bytes_billed`.
-- Gemini — fail-fast: `LLM_MAX_RETRIES=1` отключает встроенный SDK-ретрай (иначе до ~4 мин backoff на 5xx/429),
-  `LLM_TIMEOUT_S=60` ограничивает зависший запрос. Ретраи 429 только жгли бы квоту.
-
-### 5.4 UI не падает
-
-- Весь прогон графа в CLI обёрнут в `try/except`; любое исключение → сценарное сообщение, REPL продолжает работу.
-- Узлы графа сами ловят ошибки и возвращают `final_message` (классификаторы из `errors.py` выбирают нужное
-  сценарное сообщение). Стектрейс — только в debug-режиме.
+- `CURRENT_USER_ID` — from env `CURRENT_USER` (default `default_user`). Prototype is single-user,
+  but owner-scoping is mandatory.
+- Preview always shows **exactly what** will be affected (id/question/time) and the record count.
+- Empty preview (0 records) — `PREVIEW_EMPTY`, no `interrupt()`.
+- Hybrid confirmation: explicit "yes"/"no" handled deterministically; anything ambiguous goes to LLM,
+  biased toward "not confirmed" (LLM error/unavailability → not confirmed — never delete on doubt).
+- "today" → `date(created_at) = date('now')` (SQLite dialect).
+- ⚠️ **Known gap (deferred):** `_inject_owner_scope` appends the predicate by string concatenation — without wrapping
+  the existing `WHERE` in parentheses and without accounting for a trailing `ORDER BY/LIMIT`. On SQL with `OR` in `WHERE` this can
+  weaken scoping. Documented in docstring of `reports_repo.py` and pinned by xfail tests (memory:
+  `owner-scope-security-gap`). Acceptable for the prototype (single-user, guard partially cuts the `OR` side-effect);
+  fix — parameterized WHERE rewrite.
 
 ---
 
-## 6. Промпты
+## 5. Requirement #3 — Resilience & Graceful Error Handling
 
-> Все промпты **захардкожены в коде и живут рядом со своим узлом** (`app/agents/*.py`), а не в отдельном
-> `prompts.py` — узел владеет своим промптом, инструменты (`app/tools/*`) промптов не содержат. Просим модель
-> отвечать на языке вопроса (Report Agent — англ. по умолчанию, переключается на язык вопроса).
+### 5.1 Guards (deterministic, `app/tools/sql_tools.py`)
 
-| Промпт | Где | Назначение |
+- **`select_only_guard`** (BigQuery): normalizes SQL, requires a single `SELECT`/`WITH ... SELECT`;
+  prohibits `INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/TRUNCATE/MERGE/...`, `;` and comments. Reject → tool
+  returns `ERROR:` → regeneration.
+- **`preview_guard`** — SELECT strictly on `saved_reports` (destructive preview and library reads).
+- **`dml_guard`** — exactly one `DELETE`/`UPDATE` on `saved_reports`, no DDL/`;`/comments (see §4).
+
+### 5.2 Retry / self-correction policy
+
+| Situation | Behavior | Limit |
 |---|---|---|
-| `_SUPERVISOR_PROMPT` | `agents/supervisor.py` | классификация в одну метку из 6; строгий one-word вывод |
-| `_QUERY_SYSTEM_TPL` | `agents/sql_agent.py` | системный промпт tool-calling: вшитая схема BQ + выбор источника/инструмента |
-| `_DESTRUCTIVE_PROMPT` + `_GUARD_HINT` | `agents/sql_agent.py` | генерация `PREVIEW:`/`ACTION:`, перегенерация при reject |
-| `_REPORT_PROMPT` / `_REVISION_PROMPT` | `agents/report_agent.py` | отчёт по данным / правка прошлого отчёта |
-| `_CONFIRM_PROMPT` / `_PICK_PROMPT` | `agents/reports_gate.py` | LLM-резолв неоднозначного подтверждения / выбор строки для UPDATE |
-| `_INFO_RESPONSE` / `OTHER_INTENT` / сценарные | `agents/supervisor.py`, `errors.py` | фиксированные ответы (не LLM) |
+| SQL failed guard / syntax / wrong column | tool → `ERROR: ...`; model fixes SQL and calls tool again | moves ≤ `MAX_SQL_ATTEMPTS+1` |
+| Query returned 0 rows | tool → `NO_DATA: ...`; model may **once** broaden filters (softly, within move budget) | within budget |
+| SQL move budget exhausted | scripted: "Could not form a query, please rephrase" (`SQL_GEN_FAILED`) | — |
+| Result still empty | scripted: "No data found for your query" (`NO_DATA`) | — |
+| BigQuery unavailable (5xx/timeout/connection) | exponential backoff `1→2→4→8→16s` in `run_with_backoff` | retry ≤ 5 |
+| Backoff exhausted | scripted: "Service temporarily unavailable, try again later" (`SERVICE_UNAVAILABLE`) | — |
+| Gemini 429 / quota / overload | **no retries** (`LLM_MAX_RETRIES=1`), immediate `LLM_UNAVAILABLE` | 1 |
+| Gemini 5xx / transient unavailability | **no app-retries** (fail-fast), `SERVICE_UNAVAILABLE` | 1 |
+| Destructive: `dml_guard` reject | regeneration with reason hint | attempt ≤ 3 |
+| Destructive: budget exhausted | scripted: `REPORTS_GEN_FAILED` | — |
+| SQLite "database is locked" / not ready | backoff (same decorator, `is_retryable_sqlite`) | retry ≤ 5 |
+| Prefs: no concrete preference extracted | scripted: `PREFS_NOT_UNDERSTOOD` (ask to clarify format/style) | — |
+| Prefs: saved but immediate re-render failed | preference persisted; "will apply to your next report" | — |
+| Any unexpected error | catch, scripted `UNEXPECTED`; in debug — traceback | — |
 
-Пример — системный промпт чтения (сокр.):
+### 5.3 Anti-cost-inflation
+
+- Hard budgets: regenerations ≤ 3, backoff ≤ 5 — model does not loop.
+- `maximum_bytes_billed` on every BigQuery query (§7.1) + default `LIMIT` for row listing (via prompt);
+  LIMIT is not imposed on aggregates (would skew the result) — protection here is `maximum_bytes_billed`.
+- Gemini — fail-fast: `LLM_MAX_RETRIES=1` disables built-in SDK retry (otherwise up to ~4 min backoff on 5xx/429),
+  `LLM_TIMEOUT_S=60` caps a hung request. 429 retries would only burn quota.
+
+### 5.4 UI does not crash
+
+- The entire graph run in CLI is wrapped in `try/except`; any exception → scripted message, REPL continues.
+- Graph nodes catch errors themselves and return `final_message` (classifiers from `errors.py` pick the right
+  scripted message). Stack trace — only in debug mode.
+
+---
+
+## 6. Prompts
+
+> All prompts are **hardcoded in the code and live next to their node** (`app/agents/*.py`), not in a separate
+> `prompts.py` — the node owns its prompt, tools (`app/tools/*`) contain no prompts. The model is asked
+> to reply in the language of the question (Report Agent — English by default, switches to question language).
+
+| Prompt | Location | Purpose |
+|---|---|---|
+| `_SUPERVISOR_PROMPT` | `agents/supervisor.py` | classification into one of 7 labels; strict one-word output |
+| `_QUERY_SYSTEM_TPL` | `agents/sql_agent.py` | tool-calling system prompt: embedded BQ schema + source/tool selection |
+| `_DESTRUCTIVE_PROMPT` + `_GUARD_HINT` | `agents/sql_agent.py` | `PREVIEW:`/`ACTION:` generation, regeneration on reject |
+| `_REPORT_PROMPT` / `_REVISION_PROMPT` | `agents/report_agent.py` | report from data / editing previous report (both apply `_prefs_clause`) |
+| `_EXTRACT_PROMPT` | `agents/prefs_agent.py` | extract `{output_format, tone, extra}` JSON from a `set_preference` message |
+| `_CONFIRM_PROMPT` / `_PICK_PROMPT` | `agents/reports_gate.py` | LLM resolution of ambiguous confirmation / row selection for UPDATE |
+| `_INFO_RESPONSE` / `OTHER_INTENT` / scripted | `agents/supervisor.py`, `errors.py` | fixed responses (not LLM) |
+
+Example — read system prompt (abbreviated):
 
 ```
 You are a data analyst for a retail analytics assistant. Answer by calling the available tools —
@@ -423,7 +466,7 @@ Rules: never DML/DDL here; never answer from assumptions; on 'ERROR:' fix SQL an
 broaden filters once; stop as soon as you have the data.
 ```
 
-Пример — деструктивная генерация (сокр.):
+Example — destructive generation (abbreviated):
 
 ```
 You write a destructive SQLite statement against the user's saved-reports library.
@@ -436,66 +479,76 @@ ACTION:  <DELETE FROM saved_reports WHERE <condition> | UPDATE saved_reports SET
 The PREVIEW must select the EXACT same rows the ACTION affects.
 ```
 
+Example — preference extraction (abbreviated):
+
+```
+The user is stating standing preferences for how analytics reports should be written.
+Extract ONLY what they explicitly express. Reply with a single compact JSON object and nothing else:
+{"output_format": <string or null>, "tone": <string or null>, "extra": <string or null>}
+If they expressed no concrete preference, set all three to null.
+User message: {message}
+```
+
 ---
 
-## 7. Внешние интеграции
+## 7. External integrations
 
-### 7.1 BigQuery (`app/sources/bigquery.py`) — дан заказчиком
+### 7.1 BigQuery (`app/sources/bigquery.py`) — provided by customer
 
-Класс `BigQueryRunner` используется как есть (`execute_query`, `get_table_schema`), плюс **обязательное
-расширение** — cost-guard `QueryJobConfig(maximum_bytes_billed=BQ_MAX_BYTES_BILLED)` и метод `list_tables()`
-(живой список таблиц). Создаётся лениво через `get_bq_runner()` (`lru_cache`).
+The `BigQueryRunner` class is used as-is (`execute_query`, `get_table_schema`), plus a **mandatory
+extension** — cost-guard `QueryJobConfig(maximum_bytes_billed=BQ_MAX_BYTES_BILLED)` and method `list_tables()`
+(live table list). Created lazily via `get_bq_runner()` (`lru_cache`).
 
-> Различение исключений `google.api_core.exceptions` → политика §5.2 в `errors.py`: **retryable**
-> (5xx/timeout — backoff) vs **query** (4xx/синтаксис/нет колонки — перегенерация SQL) vs **forbidden**
-> (permissions/billing — не ретраим, `UNEXPECTED`).
+> Exception distinguishing `google.api_core.exceptions` → policy §5.2 in `errors.py`: **retryable**
+> (5xx/timeout — backoff) vs **query** (4xx/syntax/missing column — SQL regeneration) vs **forbidden**
+> (permissions/billing — no retry, `UNEXPECTED`).
 
-### 7.2 LLM — Google Gemini (`app/llm.py`, через `langchain-google-genai`)
+### 7.2 LLM — Google Gemini (`app/llm.py`, via `langchain-google-genai`)
 
-- `ChatGoogleGenerativeAI(model=..., temperature=..., max_retries=1, timeout=60)`, ключ из `GOOGLE_API_KEY`.
-  Клиент кэшируется (`lru_cache`) на `(model, temperature)`. `llm_text()` нормализует ответ (строка или
-  content-блоки Gemini 3.x).
+- `ChatGoogleGenerativeAI(model=..., temperature=..., max_retries=1, timeout=60)`, key from `GOOGLE_API_KEY`.
+  Client cached (`lru_cache`) on `(model, temperature)`. `llm_text()` normalizes response (string or
+  Gemini 3.x content blocks).
 
-| Агент | Модель (env, дефолт) |
+| Agent | Model (env, default) |
 |---|---|
 | Supervisor / confirm-residual / pick | `SUPERVISOR_MODEL` = `gemini-2.5-flash-lite` |
 | SQL Agent | `SQL_MODEL` = `gemini-3.5-flash` |
 | Report Agent | `REPORT_MODEL` = `gemini-2.5-flash` |
 
-### 7.3 Трейсинг — Arize Phoenix (`app/observability.py`) — opt-in
+### 7.3 Tracing — Arize Phoenix (`app/observability.py`) — opt-in
 
-- Включается `--trace` / `TRACING=1`. Инициализируется **до** сборки графа; ошибки **не фатальны**.
-- Эмбеддед-UI (`px.launch_app()` → `http://localhost:6006`) или внешний коллектор
-  (`PHOENIX_COLLECTOR_ENDPOINT`, чтобы трейсы сохранялись между прогонами). Инструментируется
-  LangChain/LangGraph через OpenInference.
-- В трейсах видны узлы графа и все LLM-вызовы (вход/выход/латентность) — источник данных для debug-режима.
-
----
-
-## 8. Debug-режим
-
-- Включается `--debug` / `DEBUG=1`.
-- **Обычный режим:** пользователь видит **только сценарные сообщения** (§5.2 / §4) — без трейсбэков/SQL.
-- **Debug-режим:** дополнительно печатается сгенерированный SQL/DML, текст ошибки, причина reject guard'а,
-  трейсбэк пойманного исключения и ссылка на Phoenix (`http://localhost:6006`).
-- Реализация: хелперы `format_error` / `format_llm_error` в `errors.py` смотрят на флаг `debug` из state.
+- Enabled by `--trace` / `TRACING=1`. Initialized **before** graph assembly; errors are **not fatal**.
+- Embedded UI (`px.launch_app()` → `http://localhost:6006`) or external collector
+  (`PHOENIX_COLLECTOR_ENDPOINT`, for traces to persist across runs). LangChain/LangGraph instrumented
+  via OpenInference.
+- Traces show graph nodes and all LLM calls (input/output/latency) — data source for debug mode.
 
 ---
 
-## 9. Запуск на другой машине
+## 8. Debug mode
 
-### 9.1 Предварительные требования
+- Enabled by `--debug` / `DEBUG=1`.
+- **Normal mode:** user sees **only scripted messages** (§5.2 / §4) — no tracebacks/SQL.
+- **Debug mode:** additionally prints generated SQL/DML, error text, guard reject reason,
+  traceback of caught exception and Phoenix link (`http://localhost:6006`).
+- Implementation: helpers `format_error` / `format_llm_error` in `errors.py` check the `debug` flag from state.
+
+---
+
+## 9. Running on another machine
+
+### 9.1 Prerequisites
 
 - Python **3.11+**.
-- GCP-проект для **биллинга BigQuery** (публичный датасет тарифицируется на ваш проект). ADC:
-  `gcloud auth application-default login` **или** `GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json`
-  (роль `roles/bigquery.user`/`dataViewer`).
-- **`GOOGLE_API_KEY`** — ключ Gemini (AI Studio). Оба (`GOOGLE_API_KEY`, `GCP_PROJECT`) проверяются на старте.
+- GCP project for **BigQuery billing** (public dataset is billed to your project). ADC:
+  `gcloud auth application-default login` **or** `GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json`
+  (role `roles/bigquery.user`/`dataViewer`).
+- **`GOOGLE_API_KEY`** — Gemini key (AI Studio). Both (`GOOGLE_API_KEY`, `GCP_PROJECT`) are validated at startup.
 
 ### 9.2 requirements.txt
 
 ```
-# дано заказчиком
+# provided by customer
 langgraph>=0.2.0
 langchain-google-genai>=1.0.0
 google-cloud-bigquery>=3.13.0
@@ -504,56 +557,56 @@ python-dotenv>=1.0.0
 langchain_core>=0.3.0
 db-dtypes==1.2.0
 
-# добавлено для прототипа
+# added for prototype
 langchain>=0.3.0
 langgraph-checkpoint-sqlite>=2.0.0     # SqliteSaver: interrupt()/resume()
-arize-phoenix>=4.0.0                    # локальный трейсинг + UI (opt-in)
+arize-phoenix>=4.0.0                    # local tracing + UI (opt-in)
 arize-phoenix-otel>=0.6.0
 openinference-instrumentation-langchain>=0.1.0
 
-# автотесты тест-плана (evals/)
-deepeval>=4.0.0                         # прогон + LLM-судьи (Gemini)
+# eval test plan (evals/)
+deepeval>=4.0.0                         # run + LLM judges (Gemini)
 pytest>=8.0.0
 ```
 
-> SQLite — из стандартной библиотеки (`sqlite3`).
+> SQLite — from the standard library (`sqlite3`).
 
-### 9.3 Переменные окружения (`.env.example`)
+### 9.3 Environment variables (`.env.example`)
 
 ```
-# Обязательные (fail-fast на старте)
+# Required (fail-fast at startup)
 GOOGLE_API_KEY=your-gemini-api-key
 GCP_PROJECT=your-gcp-project-id
 
-# BigQuery auth (опц., если не gcloud ADC)
+# BigQuery auth (opt., if not using gcloud ADC)
 # GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
-# Модели (дефолты показаны)
+# Models (defaults shown)
 SUPERVISOR_MODEL=gemini-2.5-flash-lite
 SQL_MODEL=gemini-3.5-flash
 REPORT_MODEL=gemini-2.5-flash
 
-# Guardrails / устойчивость
+# Guardrails / resilience
 DEFAULT_LIMIT=100
-MAX_BYTES_BILLED=1073741824            # 1 GiB cost-guard на запрос
-RETRY_ATTEMPTS=3                       # бюджет регенерации SQL
-AFK_TIMEOUT_S=30                       # резерв под авто-отмену подтверждения
-LLM_TIMEOUT_S=60                       # таймаут одного Gemini-запроса (SDK-ретраи выключены)
+MAX_BYTES_BILLED=1073741824            # 1 GiB cost-guard per query
+RETRY_ATTEMPTS=3                       # SQL regeneration budget
+AFK_TIMEOUT_S=30                       # reserved for auto-cancel of confirmation
+LLM_TIMEOUT_S=60                       # timeout for one Gemini request (SDK retries disabled)
 
-# Локальное хранилище / личность
+# Local storage / identity
 DB_PATH=agentic.db
 CURRENT_USER=default_user
 
-# Verbosity (= --debug) и трейсинг (= --trace)
+# Verbosity (= --debug) and tracing (= --trace)
 DEBUG=
 TRACING=
-# PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006   # внешний коллектор вместо эмбеддед
+# PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006   # external collector instead of embedded
 ```
 
-> Внутренние дефолты (не в `.env`): `CHECKPOINTS_PATH=checkpoints.db`, `TRIO_AFK_TIMEOUT_S=300`,
+> Internal defaults (not in `.env`): `CHECKPOINTS_PATH=checkpoints.db`, `TRIO_AFK_TIMEOUT_S=300`,
 > backoff `1→2→4→8→16` (≤5), `LLM_MAX_RETRIES=1`.
 
-### 9.4 Шаги
+### 9.4 Steps
 
 ```bash
 git clone <repo> && cd retail-data-analysis-assistant
@@ -562,21 +615,22 @@ git checkout implementation
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-cp .env.example .env        # заполнить GOOGLE_API_KEY, GCP_PROJECT
-gcloud auth application-default login    # если не используете SA json
+cp .env.example .env        # fill in GOOGLE_API_KEY, GCP_PROJECT
+gcloud auth application-default login    # if not using SA json
 
-python main.py              # запуск CLI (init_db() выполняется автоматически)
-python main.py --debug      # ошибки/трейсбэки
-python main.py --trace      # Phoenix на http://localhost:6006
+python main.py              # launch CLI (init_db() runs automatically)
+python main.py --debug      # errors/tracebacks
+python main.py --trace      # Phoenix at http://localhost:6006
 ```
 
 ---
 
 ## 10. SQLite DDL (`app/sources/db.py`)
 
-> Активно используется: **`saved_reports`**. Write-only: **`staged_trios`**. Определены для полноты схемы,
-> но в активном потоке не читаются/не заполняются: **`trios`** (Golden Bucket — вне scope), **`user_prefs`**
-> (опциональное чтение `output_format`). Чекпоинты LangGraph создаёт `SqliteSaver` сам в `checkpoints.db`.
+> Actively used: **`saved_reports`** (read/write) and **`user_prefs`** (read by Report agent,
+> read-merge-write UPSERT by Prefs Agent on `set_preference`). Write-only: **`staged_trios`**. Defined
+> for schema completeness but not read/filled in the active flow: **`trios`** (Golden Bucket — out of
+> scope). LangGraph checkpoints are created by `SqliteSaver` itself in `checkpoints.db`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS saved_reports (
@@ -633,27 +687,27 @@ class AgentState(TypedDict, total=False):
     question: str
     user_id: str
     debug: bool
-    intent: Literal["query", "destructive", "regenerate", "other"]
+    intent: Literal["query", "destructive", "regenerate", "set_preference", "other"]
 
     # SQL agent
-    schema_text: str            # вшитая схема BQ (кэш на сессию)
+    schema_text: str            # embedded BQ schema (cached per session)
     sql: str
     sql_attempts: int
     last_error: Optional[str]
     rows_markdown: Optional[str]
     df_row_count: int
-    data_source: Optional[str]  # analytical | schema | reports — выбран SQL-агентом
+    data_source: Optional[str]  # analytical | schema | reports — chosen by SQL agent
 
     # report
     report_md: Optional[str]
-    last_question: Optional[str]  # для regenerate (общий thread)
+    last_question: Optional[str]  # for regenerate (shared thread)
 
     # reports gate (DML confirmation)
     preview_sql: Optional[str]
     preview_rows: Optional[List[dict]]
     confirmed: Optional[bool]
 
-    # отложенный захват тройки (set report_agent → flush supervisor/CLI)
+    # deferred triple capture (set by report_agent → flushed by supervisor/CLI)
     pending_trio: Optional[dict]
 
     final_message: str
@@ -661,187 +715,194 @@ class AgentState(TypedDict, total=False):
 
 ---
 
-## 12. Пример CLI-сессии
+## 12. Example CLI session
 
 ```
 $ python main.py
-Retail Analysis Assistant. Введите вопрос ('exit' для выхода).
+Retail Analysis Assistant. Enter your question ('exit' to quit).
 
-> Покажи топ-5 клиентов по суммарным тратам
+> Show top 5 customers by total spending
 [intent: query]
-📊 Топ-5 клиентов по тратам
-| # | Клиент | Сумма трат |
+📊 Top 5 customers by spending
+| # | Customer | Total Spent |
 | ... |
-_(отчёт сохранён в библиотеку)_
+_(report saved to library)_
 
-> сделай в виде маркированного списка
+> make it a bullet list
 [intent: regenerate]
 • ... — ...
-_(отчёт сохранён в библиотеку)_
+_(report saved to library)_
 
-> Какие таблицы есть в базе и какие колонки в orders?
+> from now on always send reports as CSV
+[intent: set_preference]
+✓ Saved your preferences: format — CSV.
+... (the last report re-rendered as CSV) ...
+
+> What tables are in the database and which columns does orders have?
 [intent: query]
-Доступны: orders, order_items, products, users, inventory_items, events, distribution_centers.
-Колонки orders: order_id, user_id, status, created_at, ...
+Available: orders, order_items, products, users, inventory_items, events, distribution_centers.
+Columns in orders: order_id, user_id, status, created_at, ...
 
-> покажи мои сохранённые отчёты
+> show my saved reports
 [intent: query]
 | id | question | created_at |
 | ... |
 
-> Удали все мои отчёты за сегодня
+> Delete all my reports from today
 [intent: destructive]
-⚠️  Под условие попали записи (удаления): 2
-  1. "Топ-5 клиентов по суммарным тратам" (2026-06-30 14:32)
-  2. "Выручка по месяцам" (2026-06-30 14:40)
-Подтвердить удаление? (да/нет): да
-✓ Удалено записей: 2.
+⚠️  Records matching the condition (deletions): 2
+  1. "Top 5 customers by total spending" (2026-06-30 14:32)
+  2. "Revenue by month" (2026-06-30 14:40)
+Confirm deletion? (yes/no): yes
+✓ Deleted records: 2.
 
-> Удали все отчёты Васи
+> Delete all of John's reports
 [intent: destructive]
-Под условие не попал ни один отчёт.
+No records matched the condition.
 
-> Покажи выручку за 1999 год
+> Show revenue for 1999
 [intent: query]
-По вашему запросу данных нет.
+No data found for your query.
 
-> Какая погода в Москве?
+> What's the weather in London?
 [intent: other]
-Я ассистент по аналитике ритейла. Спросите про клиентов, товары, заказы, выручку или структуру базы
-данных — либо управляйте сохранёнными отчётами (посмотреть, найти, удалить).
+I am a retail analytics assistant. Ask me about customers, products, orders, revenue or database
+structure — or manage your saved reports (view, search, delete).
 
 > exit
-До свидания!
+Goodbye!
 ```
 
-В **debug-режиме** дополнительно печатаются сгенерированный SQL/DML, текст ошибки BigQuery, причина reject
-guard'а, трейсбэк и ссылка на Phoenix-трейс.
+In **debug mode** the generated SQL/DML, BigQuery error text, guard reject reason, traceback and Phoenix trace link are additionally printed.
 
 ---
 
-## 13. Тесты
+## 13. Tests
 
-Два независимых набора.
+Two independent suites.
 
-### 13.1 Unit-набор (`tests/`, ~169 тестов) — по умолчанию
+### 13.1 Unit suite (`tests/`, ~178 tests) — default
 
-Детерминированные, **без сети/LLM/BigQuery** (`pytest.ini` → `testpaths = tests`). Покрывают:
-guard'ы (`select/preview/dml`), owner-scoping и репозитории, backoff/классификацию ошибок, роутеры графа,
-узлы (supervisor/sql_agent/report_agent/reports_gate), CLI-хелперы, config, init_db, tracing-init.
-**Owner-scope gap** закреплён xfail-тестами (memory: `owner-scope-security-gap`).
+Deterministic, **no network/LLM/BigQuery** (`pytest.ini` → `testpaths = tests`). Covers:
+guards (`select/preview/dml`), owner-scoping and repositories (incl. `UserPrefsRepo` UPSERT/merge),
+backoff/error classification, graph routers, nodes (supervisor/sql_agent/report_agent/reports_gate/prefs_agent),
+CLI helpers, config, init_db, tracing-init.
+**Owner-scope gap** is pinned by xfail tests (memory: `owner-scope-security-gap`).
 
 ```bash
-pytest                 # весь unit-набор
+pytest                 # full unit suite
 ```
 
-### 13.2 Eval-набор (`evals/`) — DeepEval, opt-in
+### 13.2 Eval suite (`evals/`) — DeepEval, opt-in
 
-Прогоняет **настоящий граф** и проверяет его метриками DeepEval. Источник кейсов — золотой набор
-[Eval-Dataset.md](Eval-Dataset.md) (+ машиночитаемый `evals/dataset.jsonl`).
+Runs the **real graph** and verifies it with DeepEval metrics. Source of cases — golden dataset
+[Eval-Dataset.md](Eval-Dataset.md) (+ machine-readable `evals/dataset.jsonl`).
 
-**Структура пакета:**
-- `harness.py` — драйвер `drive(question, confirm=...)` гоняет вопрос через скомпилированный граф
-  (включая interrupt/resume) на **изолированной** временной SQLite-библиотеке; плюс fault-injection
-  (`fake_llms`, `fake_bq`, `no_sleep`) для offline-кейсов; `seed_report` для подготовки деструктива.
-- `metrics.py` — **детерминированные** `BaseMetric` (читают структурный `RunResult`: intent/data_source,
-  превью, owner-scoping, бюджеты, backoff-последовательность) + **LLM-судьи** `GEval` на Gemini
-  (Language Match, Analytical Relevance) — той же `GOOGLE_API_KEY`, без OpenAI.
-- `cases.py` — кейсы как данные: **live** (реальные Gemini+BigQuery; авто-skip без кредов) и **faults**
-  (скриптованные доплеры, offline, детерминированно). `MANUAL_ONLY` — что оставлено на ручную проверку.
-- `test_assistant.py` — параметризованный pytest (`assert_test`); `run.py` — runner со сводной таблицей
-  PASS/FAIL и CI-кодом возврата; `conftest.py` держит DeepEval локальным (без телеметрии).
+**Package structure:**
+- `harness.py` — driver `drive(question, confirm=...)` runs the question through the compiled graph
+  (including interrupt/resume) on an **isolated** temporary SQLite library; plus fault-injection
+  (`fake_llms`, `fake_bq`, `no_sleep`) for offline cases; `seed_report` for destructive setup.
+- `metrics.py` — **deterministic** `BaseMetric` (read structural `RunResult`: intent/data_source,
+  preview, owner-scoping, budgets, backoff sequence) + **LLM judges** `GEval` on Gemini
+  (Language Match, Analytical Relevance) — same `GOOGLE_API_KEY`, no OpenAI.
+- `cases.py` — cases as data: **live** (real Gemini+BigQuery; auto-skip without credentials) and **faults**
+  (scripted fault injections, offline, deterministic). `MANUAL_ONLY` — what is left for manual verification.
+- `test_assistant.py` — parameterized pytest (`assert_test`); `run.py` — runner with summary table
+  PASS/FAIL and CI return code; `conftest.py` keeps DeepEval local (no telemetry).
 
-**Что покрывают кейсы:**
+**What the cases cover:**
 
-| Группа | Кейсы | Тип | Проверяет |
+| Group | Cases | Type | Verifies |
 |---|---|---|---|
-| A — аналитика | A1, A5 | live | intent `query`/`analytical`, число строк, отчёт сохранён, язык, релевантность |
-| B — структура БД | B1, B2 | live | `data_source=schema`, реальные таблицы/колонки, без обращения к BigQuery |
-| C — Oversight | C1–C4, C6 | live | превью→подтверждение→удаление, отмена, пустое превью, точечность, owner-scoping |
-| C-guard | C7, C8, C9, C10 | fault | `dml_guard` режет `;DROP`/чужую таблицу; input-guard режет инъекции на входе |
-| D — Resilience | D1, D2 | live | `NO_DATA`; распознавание отсутствующей таблицы (`super_sales`) |
-| D — Resilience | D4, D5, D6 | fault | backoff `1→2→4→8→16` к BigQuery; Gemini 429 без ретраев; исключение в узле — graceful |
-| E — роутинг | E1, E2 | live | off-topic/приветствие → `other`, без обращения к данным |
+| A — analytics | A1, A5 | live | intent `query`/`analytical`, row count, report saved, language, relevance |
+| B — DB structure | B1, B2 | live | `data_source=schema`, real tables/columns, no BigQuery calls |
+| C — Oversight | C1–C4, C6 | live | preview→confirmation→deletion, cancel, empty preview, precision, owner-scoping |
+| C-guard | C7, C8, C9, C10 | fault | `dml_guard` cuts `;DROP`/foreign table; input-guard cuts injections at the gate |
+| D — Resilience | D1, D2 | live | `NO_DATA`; recognition of missing table (`super_sales`) |
+| D — Resilience | D4, D5, D6 | fault | backoff `1→2→4→8→16` to BigQuery; Gemini 429 without retries; exception in node — graceful |
+| E — routing | E1, E2 | live | off-topic/greeting → `other`, no data access |
+| G — preferences | G1, G2 | fault | `set_preference` → JSON extract → `user_prefs` UPSERT (full + partial-merge keeps default `table`), offline |
+| G — preferences | G3 | live | real classification → real extractor write to `user_prefs`; application to next report covered by a unit test |
 
-**Запуск:**
+**Running:**
 
 ```bash
-python -m evals.run                  # все (live skip без кредов)
-python -m evals.run --subset faults  # offline fault-кейсы (без кредов, без затрат)
-python -m evals.run --subset live    # только live (нужны GOOGLE_API_KEY/GCP_PROJECT + ADC)
-pytest evals/                        # через pytest
+python -m evals.run                  # all (live skip without credentials)
+python -m evals.run --subset faults  # offline fault cases (no credentials, no cost)
+python -m evals.run --subset live    # live only (needs GOOGLE_API_KEY/GCP_PROJECT + ADC)
+pytest evals/                        # via pytest
 deepeval test run evals/test_assistant.py
 ```
 
-**Известные сигналы (memory: `evals-findings`):**
-- **D1** — если модель напишет агрегат `SUM(...)` вместо детального запроса, на «выручку за 1999» вернётся
-  1 строка `NULL` (а не 0 строк), ветка «пусто → ревизия» не сработает; эталон ждёт `NO_DATA` — расхождение
-  фиксируется как риск (лечится ужесточением промпта).
-- **Live-набор** чувствителен к квоте Gemini free-tier — гонять подмножествами (`-k "A1 or B1 or C1"`).
-  Offline-набор (`--subset faults`) стабильно зелёный без кредов.
+**Known signals (memory: `evals-findings`):**
+- **D1** — if the model writes an aggregate `SUM(...)` instead of a detailed query, for "revenue in 1999" it will return
+  1 row with `NULL` (not 0 rows), the "empty → revision" branch won't trigger; the baseline expects `NO_DATA` — the discrepancy
+  is tracked as a risk (fix: tighten the prompt).
+- **Live suite** is sensitive to Gemini free-tier quota — run in subsets (`-k "A1 or B1 or C1"`).
+  Offline suite (`--subset faults`) is stably green without credentials.
 
 ---
 
-## 14. Критерии готовности (acceptance)
+## 14. Acceptance criteria
 
-1. CLI запускается по §9 на чистой машине; `init_db()` автоматически создаёт все таблицы из §10.
-2. Аналитический вопрос → агент генерирует **валидный BigQuery SELECT**, исполняет, возвращает markdown-отчёт,
-   сохраняет его в `saved_reports`.
-3. Вопрос про структуру БД отвечается из вшитой схемы (`data_source=schema`), без обращения к BigQuery.
-4. Просмотр библиотеки («покажи мои отчёты») работает через `query_saved_reports` (owner-scoped).
-5. **Resilience:** кривой SQL → самокоррекция (бюджет ходов), затем сценарное; пустой результат → `NO_DATA`;
-   недоступность BigQuery → backoff (≤5) → `SERVICE_UNAVAILABLE`; Gemini 429/5xx → fail-fast; REPL не падает.
-6. **High-Stakes Oversight:** «удали … за сегодня»/«про X» → превью → `interrupt()` → подтверждение → удаление;
-   «нет» отменяет; пустое превью не уходит в подтверждение; `dml_guard` режет не-DELETE/UPDATE и чужие таблицы;
-   репозиторий всегда инжектит `owner_id`; инъекции режутся на входе.
-7. Все LLM-вызовы и узлы графа видны в Phoenix (при `--trace`).
-8. Debug-режим показывает SQL/ошибки/трейсбэки; обычный режим — только сценарные сообщения.
-9. Промпты захардкожены в коде рядом с узлами (`app/agents/*.py`).
-10. Unit-набор (`pytest`) зелёный; offline eval-набор (`python -m evals.run --subset faults`) зелёный.
+1. CLI starts per §9 on a clean machine; `init_db()` automatically creates all tables from §10.
+2. Analytical question → agent generates **valid BigQuery SELECT**, executes, returns markdown report,
+   saves it to `saved_reports`.
+3. DB structure question is answered from embedded schema (`data_source=schema`), without querying BigQuery.
+4. Library browsing ("show my reports") works via `query_saved_reports` (owner-scoped).
+5. **Resilience:** bad SQL → self-correction (move budget), then scripted; empty result → `NO_DATA`;
+   BigQuery unavailability → backoff (≤5) → `SERVICE_UNAVAILABLE`; Gemini 429/5xx → fail-fast; REPL does not crash.
+6. **High-Stakes Oversight:** "delete … from today"/"about X" → preview → `interrupt()` → confirmation → deletion;
+   "no" cancels; empty preview does not go to confirmation; `dml_guard` cuts non-DELETE/UPDATE and foreign tables;
+   repository always injects `owner_id`; injections cut at input.
+7. All LLM calls and graph nodes are visible in Phoenix (with `--trace`).
+8. Debug mode shows SQL/errors/tracebacks; normal mode — only scripted messages.
+9. Prompts are hardcoded in the code next to nodes (`app/agents/*.py`).
+10. Unit suite (`pytest`) is green; offline eval suite (`python -m evals.run --subset faults`) is green.
 
 ---
 
-## 15. Соответствие исходным требованиям (трассировка + проверка)
+## 15. Alignment with original requirements (traceability + verification)
 
-### 15.1 Обязательные требования задания
+### 15.1 Mandatory assignment requirements
 
-| Требование задания | Статус | Где в прототипе |
+| Assignment requirement | Status | Where in prototype |
 |---|---|---|
-| **1.** Working prototype: chat-агент, динамический SQL к БД, создание отчёта; **поддержать 2 из** {#2 High-Stakes Oversight, #3 Resilience} | ✅ оба #2 и #3 | §3.3 (SQL), §3.4 (Report), §4 (#2), §5 (#3) |
-| **2.** Простой **CLI**-интерфейс (UI не нужен) | ✅ | §3.1, `app/cli.py` |
-| **3.** Запускается на другой машине (Docker не обязателен, нужны инструкции) | ✅ | §9, `README.md`, `.env.example`, `requirements.txt` |
-| **4.** Фреймворк по выбору (предпочтительно LangGraph / LangChain) | ✅ LangGraph + `langchain-google-genai` | §2.1, §7.2 |
-| Простота и работоспособность | ✅ | минимальный стек, локальный SQLite, без облака |
+| **1.** Working prototype: chat agent, dynamic SQL to DB, report creation; **support 2 of** {#2 High-Stakes Oversight, #3 Resilience} | ✅ both #2 and #3 | §3.3 (SQL), §3.4 (Report), §4 (#2), §5 (#3) |
+| **2.** Simple **CLI** interface (no UI needed) | ✅ | §3.1, `app/cli.py` |
+| **3.** Runs on another machine (Docker not required, instructions needed) | ✅ | §9, `README.md`, `.env.example`, `requirements.txt` |
+| **4.** Framework of choice (preferably LangGraph / LangChain) | ✅ LangGraph + `langchain-google-genai` | §2.1, §7.2 |
+| Simplicity and operability | ✅ | minimal stack, local SQLite, no cloud |
 
-### 15.2 Ожидаемые возможности агента
+### 15.2 Expected agent capabilities
 
-| Возможность | Статус | Где |
+| Capability | Status | Where |
 |---|---|---|
-| Customer behavior (топ-клиенты, суммарные траты) | ✅ | Eval A1–A6, §3.3 |
+| Customer behavior (top customers, total spending) | ✅ | Eval A1–A6, §3.3 |
 | Product performance | ✅ | Eval B1–B5 |
-| Time-based metrics (выручка по месяцам, актуальная по товарам) | ✅ | Eval C1–C5 |
-| Вопросы про структуру БД | ✅ | Eval D1–D4, `data_source=schema` |
-| BigQuery-интеграция, **динамическая** генерация и исполнение SQL | ✅ | §3.3, §7.1, `tools/query_tools.py` |
-| Новая модель Gemini | ✅ | SQL — `gemini-3.5-flash`; см. §7.2 |
+| Time-based metrics (monthly revenue, current by product) | ✅ | Eval C1–C5 |
+| DB structure questions | ✅ | Eval D1–D4, `data_source=schema` |
+| BigQuery integration, **dynamic** SQL generation and execution | ✅ | §3.3, §7.1, `tools/query_tools.py` |
+| New Gemini model | ✅ | SQL — `gemini-3.5-flash`; see §7.2 |
 
-### 15.3 Выбранные требования (#2, #3) и инфраструктура
+### 15.3 Selected requirements (#2, #3) and infrastructure
 
-| Источник | Статус | Где |
+| Source | Status | Where |
 |---|---|---|
 | #2 High-Stakes Oversight | ✅ | §4, §10 (`saved_reports`), Eval C1–C10 |
 | #3 Resilience & Graceful Error Handling | ✅ | §2.2, §5, Eval D1/D2/D4/D5/D6 |
-| Трейсинг (Phoenix) + debug-режим | ✅ (трейсинг opt-in) | §7.3, §8 |
-| Хардкод-промптов | ✅ (рядом с узлами) | §6 |
+| Tracing (Phoenix) + debug mode | ✅ (tracing opt-in) | §7.3, §8 |
+| Hardcoded prompts | ✅ (next to nodes) | §6 |
 | SQLite + DDL | ✅ | §10 |
-| Eval/Unit-тесты | ✅ | §13 |
-| Вне scope: Golden Bucket retrieval, Evaluator, PII, Learning Loop, Persona | — | §1.4 |
+| Eval/Unit tests | ✅ | §13 |
+| Learning Loop (#4) — **explicit** path (`set_preference` → `user_prefs` → applied to reports) | ⚠️ partial | §3.5 (Prefs Agent), §1.3, Eval G1–G3 |
+| Out of scope: Golden Bucket retrieval, Evaluator, PII, implicit Prefs Extractor, Persona | — | §1.4 |
 
-### 15.4 Вердикт
+### 15.4 Verdict
 
-Прототип **полностью покрывает обязательную часть задания** (чат-агент с динамическим BigQuery-SQL,
-создание отчётов, CLI, воспроизводимый запуск, LangGraph + новый Gemini) и **оба выбранных требования**
-(#2 High-Stakes Oversight с превью/подтверждением/owner-scoping и многослойной защитой; #3 Resilience с
-двумя независимыми бюджетами, fail-fast LLM и неубиваемым REPL). Сверх минимума добавлены просмотр
-библиотеки, правка отчётов (`regenerate`), input-guard от инъекций, гибридное подтверждение и набор
-eval/unit-тестов. Открытый технический долг — owner-scope string-concat gap (§4.3), зафиксирован xfail-тестами.
-```
+The prototype **fully covers the mandatory part of the assignment** (chat agent with dynamic BigQuery SQL,
+report creation, CLI, reproducible launch, LangGraph + new Gemini) and **both selected requirements**
+(#2 High-Stakes Oversight with preview/confirmation/owner-scoping and multi-layer defense; #3 Resilience with
+two independent budgets, fail-fast LLM, and an indestructible REPL). Beyond the minimum, added: library browsing,
+report editing (`regenerate`), explicit report preferences (`set_preference` → `user_prefs`, a synchronous
+slice of Learning Loop #4), input injection guard, hybrid confirmation, and eval/unit test suites. Open technical debt — owner-scope string-concat gap (§4.3), pinned by xfail tests.

@@ -541,7 +541,7 @@ the user without any internal processing.
 **Solution:**
 
 0. **Input injection-guard** (deterministic, in the Supervisor): before the SQL agent, explicit SQL injections
-   (`; DROP`, `--`, `UNION SELECT`), prompt injections (EN/RU: "ignore your rules" / "игнорируй правила"), and
+   (`; DROP`, `--`, `UNION SELECT`), prompt injections in English (e.g. "ignore your rules"), and
    references to foreign (BigQuery) tables in a destructive request are cut off → rejected with a warning.
 1. The Supervisor detects `intent = destructive` at the classification level
 2. The SQL Agent (context = `saved_reports`) generates two artifacts (structured `PREVIEW:`/`ACTION:` output):

@@ -32,18 +32,13 @@ _INJECTION_RE = re.compile(
     r"|\bunion\s+select\b"
     r"|\bexec\s*\("
     r"|\bexecute\s*\("
-    # --- Natural-language prompt injection (EN) ---
+    # --- Natural-language prompt injection ---
     r"|\bignore\s+(your\s+)?(rules|instructions|system|constraints|prompt)\b"
     r"|\bforget\s+(your\s+)?(rules|instructions|previous)\b"
     r"|\bbypass\s+(the\s+)?(rules|restrictions|guard|filter)\b"
     r"|\bdisregard\s+(your\s+)?(rules|instructions)\b"
-    # --- Natural-language prompt injection (RU) ---
-    r"|\bигнорируй\s+(свои\s+)?(правила|инструкции|ограничения)\b"
-    r"|\bзабудь\s+(свои\s+)?(правила|инструкции)\b"
-    r"|\bобойди\s+(правила|ограничения|фильтр)\b"
-    r"|\bне\s+следуй\s+(правилам|инструкциям)\b"
     # --- Protected BigQuery table reference in a destructive request ---
-    r"|\b(?:from|из\s+таблицы|таблицу?)\s+"
+    r"|\bfrom\s+"
     r"(users|orders|products|inventory_items|order_items|events|distribution_centers)\b",
     re.IGNORECASE,
 )
@@ -61,29 +56,25 @@ Classify the user's message into EXACTLY one label:
   (customers, products, orders, revenue, time-based metrics), questions about the
   database STRUCTURE/schema (which tables or columns exist, types), OR browsing the
   user's saved-reports library (list/view/search, e.g. "show my reports",
-  "покажи мои отчёты", "find reports about client X", "покажи второй отчёт").
+  "find reports about client X", "show me the second report").
 - "destructive": a request to DELETE or MODIFY saved reports (e.g. "delete my reports",
-  "удали отчёты про клиента X", "переименуй отчёт", "очисти библиотеку за сегодня").
+  "delete reports about client X", "rename the report", "clear today's reports").
 - "regenerate": a ONE-OFF request to FIX, redo, reformat, shorten, or adjust THIS PREVIOUS report
-  the assistant just produced (e.g. "сделай короче", "в виде маркированного списка",
-  "убери лишнее", "перегенерируй", "не то, переделай", "now show it as bullet points").
+  the assistant just produced (e.g. "make it shorter", "as a bullet list",
+  "remove the extras", "regenerate it", "that's wrong, redo it", "now show it as bullet points").
   No new data needs to be queried. The change applies only to the current report.
 - "set_preference": the user wants the assistant to REMEMBER a standing preference for how ALL
   FUTURE reports should be written — their default format, length, tone, or style. It is a setting
   to save, not an analytical question and not a one-off edit of the current report. Examples (ALL of
-  these are set_preference): "всегда присылай отчёты в формате CSV", "присылай отчёты в виде CSV",
-  "по умолчанию делай отчёты покороче", "впредь выводи отчёты маркированным списком",
-  "запомни: люблю краткие сводки без эмодзи", "хочу всегда видеть таблицу", "формат по умолчанию — CSV",
-  "from now on use bullet points", "always format reports as a table", "by default keep it short".
-  Strong cues: "всегда", "по умолчанию", "впредь", "запомни", "хочу чтобы"/"хочу всегда", "always",
-  "from now on", "by default" — together with a mention of report format / length / tone / style.
+  these are set_preference): "from now on use bullet points", "always format reports as a table",
+  "by default keep it short", "always send reports in CSV format", "remember: keep it brief".
+  Strong cues: "always", "from now on", "by default", "remember" — together with a mention of
+  report format / length / tone / style.
 - "feedback_positive": the user expresses satisfaction or approval of the previous report
-  (e.g. "нравится", "отлично", "хорошо", "спасибо", "супер", "класс", "всё верно",
-  "👍", "great", "perfect", "thanks", "cool").
+  (e.g. "great", "perfect", "thanks", "cool", "nice", "👍", "looks good", "exactly right").
 - "info": a meta question about THIS ASSISTANT's capabilities, what databases or data
   sources it can access, or what it can do (e.g. "which databases do you have access to",
-  "what can you query", "in which db I have access", "к каким данным у тебя есть доступ",
-  "что ты умеешь", "what data do you have").
+  "what can you query", "in which db I have access", "what data do you have").
 - "other": greetings, off-topic, or unintelligible requests. NOT for report-format/style
   preferences (those are set_preference) and NOT for analytical questions (those are query).
 Tie-break: if the message tells the assistant how it should format or write reports from now on

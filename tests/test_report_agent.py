@@ -18,7 +18,7 @@ from app.agents.report_agent import report_agent
 from tests.conftest import FakeLLM
 
 
-def _state(question="сколько заказов?", debug=False, sql="SELECT 1",
+def _state(question="how many orders?", debug=False, sql="SELECT 1",
            rows="| a |\n| - |\n| 1 |", **extra):
     return {"question": question, "debug": debug, "sql": sql,
             "rows_markdown": rows, **extra}
@@ -35,22 +35,23 @@ def llm(fake_llm_factory):
 # Normal mode — generate + save
 # --------------------------------------------------------------------------- #
 def test_report_generated_and_saved(llm, patched_conn):
-    llm(["Отчёт: 42 заказа."])
+    llm(["Report: 42 orders."])
     out = report_agent(_state())
 
-    assert out["report_md"] == "Отчёт: 42 заказа."
-    assert "report saved" in out["final_message"]
+    assert out["report_md"] == "Report: 42 orders."
+    # The report is persisted silently — no "saved to library" note in the output.
+    assert out["final_message"] == "Report: 42 orders."
     assert patched_conn.execute("SELECT COUNT(*) FROM saved_reports").fetchone()[0] == 1
 
 
 def test_report_persists_question_and_sql(llm, patched_conn):
     llm(["body"])
-    report_agent(_state(question="вопрос", sql="SELECT 7"))
+    report_agent(_state(question="test question", sql="SELECT 7"))
     row = patched_conn.execute(
         "SELECT owner_id, question, sql_query FROM saved_reports"
     ).fetchone()
     assert row["owner_id"] == config.CURRENT_USER_ID
-    assert row["question"] == "вопрос"
+    assert row["question"] == "test question"
     assert row["sql_query"] == "SELECT 7"
 
 
@@ -139,12 +140,12 @@ def test_stored_prefs_reach_the_prompt(llm, patched_conn):
 def test_regenerate_revises_previous_report(llm, patched_conn):
     llm(["revised report"])
     out = report_agent({
-        "question": "сделай короче",
+        "question": "make it shorter",
         "debug": False,
         "intent": "regenerate",
         "report_md": "original long report",
         "rows_markdown": "| a | 1 |",
-        "last_question": "сколько заказов?",
+        "last_question": "how many orders?",
         "sql": "SELECT 1",
     })
     assert out["report_md"] == "revised report"
@@ -154,7 +155,7 @@ def test_regenerate_revises_previous_report(llm, patched_conn):
 def test_regenerate_no_previous_returns_error(llm, patched_conn):
     llm(["ignored"])
     out = report_agent({
-        "question": "сделай короче",
+        "question": "make it shorter",
         "debug": False,
         "intent": "regenerate",
         "report_md": "",

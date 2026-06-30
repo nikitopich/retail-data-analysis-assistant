@@ -19,7 +19,7 @@ from app.agents.prefs_agent import prefs_agent
 from tests.conftest import FakeLLM
 
 
-def _state(question="всегда присылай отчёты в виде CSV", **extra):
+def _state(question="always send reports in CSV format", **extra):
     return {"question": question, "user_id": config.CURRENT_USER_ID, "debug": False, **extra}
 
 
@@ -71,12 +71,12 @@ def test_rerenders_last_report_when_present(llm, patched_conn):
     out = prefs_agent(_state(
         report_md="| orders |\n| - |\n| 42 |",
         rows_markdown="| orders | 42 |",
-        last_question="сколько заказов?",
+        last_question="how many orders?",
     ))
     assert out["report_md"] == "id,orders\n1,42"
     assert "Saved" in out["final_message"]
     assert "id,orders" in out["final_message"]
-    assert out["last_question"] == "сколько заказов?"
+    assert out["last_question"] == "how many orders?"
     # A pure preference change must NOT create a new saved report.
     assert patched_conn.execute("SELECT COUNT(*) FROM saved_reports").fetchone()[0] == 0
     # Two LLM calls: extraction then revise.

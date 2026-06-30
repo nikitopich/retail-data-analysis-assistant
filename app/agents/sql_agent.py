@@ -54,7 +54,7 @@ Rules:
 - Updating: UPDATE saved_reports SET <col> = <val> WHERE <condition>
   Allowed columns to SET: question, report_md, published_to_golden
 - Searching by topic: ALWAYS use LIKE '%term%', even when the user puts the name in quotes —
-  saved titles may have extra words (e.g. WHERE question LIKE '%Топ-5 клиентов%')
+  saved titles may have extra words (e.g. WHERE question LIKE '%Top 5 Customers%')
 - "today" → date(created_at) = date('now')
 
 Output EXACTLY TWO lines (no prose, no markdown fences):

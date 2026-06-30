@@ -171,9 +171,6 @@ def main() -> None:
 
         try:
             result = app.invoke(init_state, run_config)
-            intent = result.get("intent")
-            if intent:
-                print(f"[intent: {intent}]")
             result = _resume_loop(app, result, run_config)
             print(result.get("final_message", "") or "")
             # Track pending_trio locally; supervisor already consumed/cleared the

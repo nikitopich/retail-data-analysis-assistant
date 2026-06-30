@@ -13,12 +13,12 @@ from app import cli
 # --------------------------------------------------------------------------- #
 def test_print_preview_lists_rows(capsys):
     cli._print_preview({"preview_rows": [
-        {"question": "про x", "created_at": "2026-06-29"},
-        {"question": "про y", "created_at": "2026-06-28"},
+        {"question": "about x", "created_at": "2026-06-29"},
+        {"question": "about y", "created_at": "2026-06-28"},
     ]})
     out = capsys.readouterr().out
     assert "2" in out
-    assert '"про x" (2026-06-29)' in out
+    assert '"about x" (2026-06-29)' in out
 
 
 def test_print_preview_empty(capsys):
@@ -30,8 +30,8 @@ def test_print_preview_empty(capsys):
 # _timed_input (non-interactive fallback)
 # --------------------------------------------------------------------------- #
 def test_timed_input_reads_line(monkeypatch):
-    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("да\n"))
-    assert cli._timed_input("prompt: ", timeout=0) == "да"
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("yes\n"))
+    assert cli._timed_input("prompt: ", timeout=0) == "yes"
 
 
 def test_timed_input_eof_returns_none(monkeypatch):
@@ -61,10 +61,10 @@ def _interrupt_result(count=1):
 
 
 def test_resume_loop_forwards_user_answer(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda prompt="": "да")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
     app = _FakeApp(final={"final_message": "ok"})
     cli._resume_loop(app, _interrupt_result(), {"configurable": {}})
-    assert app.resumed_with == "да"
+    assert app.resumed_with == "yes"
 
 
 def test_resume_loop_eof_sends_no(monkeypatch):

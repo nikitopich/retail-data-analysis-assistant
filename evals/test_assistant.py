@@ -23,14 +23,14 @@ _CREDS = harness.has_creds()
 @pytest.mark.parametrize("case", all_cases(), ids=lambda c: c.id)
 def test_manual_plan_case(case: Case):
     if case.requires_creds and not _CREDS:
-        pytest.skip("live-кейс: не заданы GOOGLE_API_KEY/GCP_PROJECT")
+        pytest.skip("live case: GOOGLE_API_KEY/GCP_PROJECT not set")
 
     with harness.isolated_db():
         run = case.execute()
 
     test_case = LLMTestCase(
         input=case.question,
-        actual_output=run.final_message or "(пустой ответ)",
+        actual_output=run.final_message or "(empty response)",
         metadata={"run": run, "case_id": case.id, "title": case.title},
     )
     assert_test(test_case, case.build_metrics(), run_async=False)

@@ -22,7 +22,7 @@ class BigQueryRunner:
         try:
             self.client = bigquery.Client(project=project_id)
             self.dataset_id = dataset_id
-            self.max_bytes_billed = max_bytes_billed  # cost-guard (см. §5.3)
+            self.max_bytes_billed = max_bytes_billed  # cost-guard (see §5.3)
             logging.info(f"BigQuery client initialized for dataset: {self.dataset_id}")
         except Exception as e:
             logging.error(f"Failed to initialize BigQuery client: {str(e)}")

@@ -1,68 +1,19 @@
-"""Saved-reports SQL generation + parsing (SQLite library).
+"""Deterministic saved-reports helpers — parsing, preview fallback, row formatting.
 
-LLM-driven SQL *building* for the saved-reports library — read (SELECT) and
-destructive (DELETE/UPDATE + preview). The deterministic guards live in
-``sql_tools``; the owner-scoped execution lives in ``sources.reports_repo``.
-The agent orchestrates the attempt/guard loop; these helpers are single-shot.
+No prompts, no LLM. SQL *generation* for the destructive path lives with the agent
+(it owns the prompt); these are the deterministic pieces the agent/gate reuse.
 """
 from __future__ import annotations
 
 import re
 
-from app.llm import llm_text
 from app.tools.sql_tools import strip_sql
-
-_REPORTS_READ_PROMPT = """You write ONE SQLite SELECT against the user's saved-reports library.
-
-Schema (live, from the database):
-{schema}
-
-Rules:
-- A single SELECT on saved_reports only. Never DML/DDL.
-- NEVER reference or filter on owner_id — ownership is enforced in code.
-- Listing/browsing: SELECT id, question, created_at FROM saved_reports ORDER BY created_at DESC LIMIT 20
-- Viewing content: SELECT question, report_md, created_at FROM saved_reports WHERE <condition>
-- Searching by topic: WHERE question LIKE '%term%' OR report_md LIKE '%term%'
-- "second" / "2nd" / "второй": LIMIT 1 OFFSET 1 with ORDER BY created_at DESC
-- "today" → date(created_at) = date('now')
-
-Output ONLY the SQL (no prose, no markdown fences).
-User question: {question}
-{error_hint}"""
-
-_DESTRUCTIVE_PROMPT = """You write a destructive SQLite statement against the user's saved-reports library.
-
-Schema (live, from the database):
-{schema}
-
-Rules:
-- The operation is a DELETE or an UPDATE on saved_reports only. Never SELECT-only, never DDL/INSERT.
-- NEVER reference or filter on owner_id — ownership is enforced in code.
-- Deleting: DELETE FROM saved_reports WHERE <condition>
-- Updating: UPDATE saved_reports SET <col> = <val> WHERE <condition>
-  Allowed columns to SET: question, report_md, published_to_golden
-- Searching by topic: WHERE question LIKE '%term%' OR report_md LIKE '%term%'
-- "today" → date(created_at) = date('now')
-
-Output EXACTLY TWO lines (no prose, no markdown fences):
-PREVIEW: SELECT id, question, created_at FROM saved_reports WHERE <condition>
-ACTION: <DELETE FROM saved_reports WHERE <condition> | UPDATE saved_reports SET ... WHERE <condition>>
-The PREVIEW must select the EXACT same rows the ACTION affects — identical WHERE clause.
-
-User question: {question}
-{error_hint}"""
-
-GUARD_HINT = (
-    "\nPrevious SQL was rejected ({reason}). "
-    "Return a valid statement on saved_reports — no DDL, no INSERT. "
-    "Keep the required output format."
-)
 
 _MARKER_RE = re.compile(r"(?im)^\s*(ACTION|PREVIEW)\s*:")
 
 
 def parse_reports_output(text: str) -> tuple[str, str]:
-    """Split the destructive-agent output into ``(action_sql, preview_sql)``.
+    """Split a destructive-generation output into ``(action_sql, preview_sql)``.
 
     The agent emits a labeled, structured response (``ACTION:`` and ``PREVIEW:``).
     Parsing the model's own preview is robust where deriving one by regex-rewriting
@@ -81,13 +32,33 @@ def parse_reports_output(text: str) -> tuple[str, str]:
     return sections.get("ACTION", "").strip(), sections.get("PREVIEW", "").strip()
 
 
-def generate_read_sql(llm, question: str, schema: str, error_hint: str = "") -> str:
-    """One SELECT over saved_reports (guard/loop handled by the caller)."""
-    prompt = _REPORTS_READ_PROMPT.format(schema=schema, question=question, error_hint=error_hint)
-    return strip_sql(llm_text(llm.invoke(prompt)))
+def make_preview_sql(dml_sql: str) -> str:
+    """Fallback: derive a preview SELECT from a DELETE/UPDATE by reusing its WHERE.
+
+    Used only when the agent did not supply its own preview. Brittle on complex
+    statements (subqueries with their own WHERE), which is why the agent emits the
+    preview directly (see ``parse_reports_output``).
+    """
+    m = re.search(r'(?i)\bwhere\b\s+(.+)$', dml_sql.strip(), re.DOTALL)
+    where = f" WHERE {m.group(1).strip()}" if m else ""
+    return f"SELECT id, question, created_at FROM saved_reports{where}"
 
 
-def generate_destructive_sql(llm, question: str, schema: str, error_hint: str = "") -> tuple[str, str]:
-    """A DELETE/UPDATE (+ preview SELECT) over saved_reports. Returns (action, preview)."""
-    prompt = _DESTRUCTIVE_PROMPT.format(schema=schema, question=question, error_hint=error_hint)
-    return parse_reports_output(llm_text(llm.invoke(prompt)))
+def format_rows(rows: list) -> str:
+    """Render a list of dict rows as a compact markdown pipe-table."""
+    if not rows:
+        return "Nothing found."
+    keys = list(rows[0].keys())
+    lines = [
+        "| " + " | ".join(keys) + " |",
+        "| " + " | ".join("---" for _ in keys) + " |",
+    ]
+    for row in rows:
+        cells = []
+        for k in keys:
+            v = str(row.get(k) or "")
+            if k in ("report_md", "sql_query") and len(v) > 120:
+                v = v[:120] + "…"
+            cells.append(v.replace("|", "\\|"))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)

@@ -39,7 +39,7 @@ def test_report_generated_and_saved(llm, patched_conn):
     out = report_agent(_state())
 
     assert out["report_md"] == "Отчёт: 42 заказа."
-    assert "отчёт сохранён" in out["final_message"]
+    assert "report saved" in out["final_message"]
     assert patched_conn.execute("SELECT COUNT(*) FROM saved_reports").fetchone()[0] == 1
 
 
@@ -93,7 +93,7 @@ def test_save_failure_debug_shows_note(llm, patched_conn, monkeypatch):
     llm(["the answer"])
     out = report_agent(_state(debug=True))
     assert out["report_md"] == "the answer"
-    assert "не удалось сохранить" in out["final_message"]
+    assert "failed to save" in out["final_message"]
 
 
 def test_save_failure_silent_in_normal_mode(llm, patched_conn, monkeypatch):

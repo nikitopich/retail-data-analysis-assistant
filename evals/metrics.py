@@ -100,7 +100,7 @@ class IntentMetric(_DeterministicMetric):
 
     def _check(self, run):
         ok = self.expected in (run.intent, run.data_source)
-        return ok, f"intent={run.intent!r}, data_source={run.data_source!r} (ожидали {self.expected!r})"
+        return ok, f"intent={run.intent!r}, data_source={run.data_source!r} (expected {self.expected!r})"
 
 
 class RoutedToOtherMetric(_DeterministicMetric):
@@ -126,9 +126,9 @@ class RowCountMetric(_DeterministicMetric):
     def _check(self, run):
         n = run.df_row_count
         if n is None:
-            return False, "df_row_count отсутствует (аналитический путь не отработал)"
+            return False, "df_row_count is absent (analytical path did not execute)"
         if self.equals is not None and n != self.equals:
-            return False, f"df_row_count={n}, ожидали ровно {self.equals}"
+            return False, f"df_row_count={n}, expected exactly {self.equals}"
         if self.minimum is not None and n < self.minimum:
             return False, f"df_row_count={n} < min {self.minimum}"
         if self.maximum is not None and n > self.maximum:
@@ -180,20 +180,20 @@ class PreviewBeforeDeleteMetric(_DeterministicMetric):
     """A confirmation interrupt fired, the preview held N rows, and the run
     finished with a delete/update confirmation of those rows."""
 
-    def __init__(self, expected_count: int, verb: str = "Удалено"):
+    def __init__(self, expected_count: int, verb: str = "Deleted"):
         super().__init__()
         self.expected_count, self.verb = expected_count, verb
         self._label = f"Preview→confirm→{verb} ({expected_count})"
 
     def _check(self, run):
         if not run.interrupted:
-            return False, "подтверждение не запрашивалось (interrupt не сработал)"
+            return False, "confirmation was not requested (interrupt did not fire)"
         n = len(run.preview_rows)
         if n != self.expected_count:
-            return False, f"в превью {n} строк, ожидали {self.expected_count}"
+            return False, f"preview has {n} rows, expected {self.expected_count}"
         if self.verb not in run.final_message:
-            return False, f"финальное сообщение без '{self.verb}': {run.final_message!r}"
-        return True, f"превью={n}, итог={run.final_message!r}"
+            return False, f"final message missing '{self.verb}': {run.final_message!r}"
+        return True, f"preview={n}, result={run.final_message!r}"
 
 
 class CancelledMetric(_DeterministicMetric):
@@ -206,13 +206,13 @@ class CancelledMetric(_DeterministicMetric):
 
     def _check(self, run):
         if not run.interrupted:
-            return False, "подтверждение не запрашивалось"
+            return False, "confirmation was not requested"
         if run.final_message.strip() != errors.CANCELLED:
-            return False, f"ожидали '{errors.CANCELLED}', получили {run.final_message!r}"
+            return False, f"expected '{errors.CANCELLED}', got {run.final_message!r}"
         remaining = len(run.saved_reports)
         if remaining != self.expected_remaining:
-            return False, f"в библиотеке {remaining}, ожидали {self.expected_remaining}"
-        return True, f"отменено, в библиотеке {remaining}"
+            return False, f"library has {remaining}, expected {self.expected_remaining}"
+        return True, f"cancelled, library has {remaining}"
 
 
 class EmptyPreviewMetric(_DeterministicMetric):
@@ -222,10 +222,10 @@ class EmptyPreviewMetric(_DeterministicMetric):
 
     def _check(self, run):
         if run.interrupted:
-            return False, "запросили подтверждение при пустом превью"
+            return False, "confirmation was requested on empty preview"
         if run.final_message.strip() != errors.PREVIEW_EMPTY:
-            return False, f"ожидали '{errors.PREVIEW_EMPTY}', получили {run.final_message!r}"
-        return True, "пустое превью, подтверждение не запрашивалось"
+            return False, f"expected '{errors.PREVIEW_EMPTY}', got {run.final_message!r}"
+        return True, "empty preview, no confirmation requested"
 
 
 class DeletedSurvivorsMetric(_DeterministicMetric):
@@ -241,11 +241,11 @@ class DeletedSurvivorsMetric(_DeterministicMetric):
         qs = run.questions()
         still_there = [q for q in qs if _contains(q, self.deleted_substr)]
         if still_there:
-            return False, f"целевой отчёт не удалён: {still_there}"
+            return False, f"target report was not deleted: {still_there}"
         missing = [s for s in self.survivors if not any(_contains(q, s) for q in qs)]
         if missing:
-            return False, f"задеты лишние отчёты, пропали: {missing}"
-        return True, f"остались: {qs}"
+            return False, f"extra reports were affected, missing: {missing}"
+        return True, f"remaining: {qs}"
 
 
 class OwnerScopeMetric(_DeterministicMetric):
@@ -260,11 +260,11 @@ class OwnerScopeMetric(_DeterministicMetric):
     def _check(self, run):
         owners = run.owners()
         if self.foreign_owner not in owners:
-            return False, f"чужой отчёт ({self.foreign_owner}) был удалён!"
+            return False, f"foreign report ({self.foreign_owner}) was deleted!"
         own_left = [o for o in owners if o == config.CURRENT_USER_ID]
         if own_left:
-            return False, f"остались свои отчёты, которые должны были удалиться: {len(own_left)}"
-        return True, f"чужой отчёт цел, свои удалены (owners={owners})"
+            return False, f"own reports that should have been deleted remain: {len(own_left)}"
+        return True, f"foreign report intact, own deleted (owners={owners})"
 
 
 # --------------------------------------------------------------------------- #
@@ -277,10 +277,10 @@ class NoCrashMetric(_DeterministicMetric):
 
     def _check(self, run):
         if run.raised is not None:
-            return False, f"исключение не поймано: {run.raised!r}"
+            return False, f"exception not caught: {run.raised!r}"
         if not run.final_message.strip():
-            return False, "пустое финальное сообщение"
-        return True, "ошибка обработана, есть сценарное сообщение"
+            return False, "empty final message"
+        return True, "error handled, scenario message present"
 
 
 class MaxCallsMetric(_DeterministicMetric):
@@ -294,8 +294,8 @@ class MaxCallsMetric(_DeterministicMetric):
     def _check(self, run):
         got = run.counters.get(self.counter_key)
         if got is None:
-            return False, f"счётчик {self.counter_key!r} не записан"
-        return got <= self.maximum, f"{self.counter_key}={got} (бюджет {self.maximum})"
+            return False, f"counter {self.counter_key!r} not recorded"
+        return got <= self.maximum, f"{self.counter_key}={got} (budget {self.maximum})"
 
 
 class BackoffSequenceMetric(_DeterministicMetric):
@@ -309,9 +309,9 @@ class BackoffSequenceMetric(_DeterministicMetric):
     def _check(self, run):
         sleeps = run.counters.get("sleeps")
         if sleeps is None:
-            return False, "задержки backoff не записаны"
+            return False, "backoff delays not recorded"
         if sleeps != self.expected_delays:
-            return False, f"задержки {sleeps}, ожидали {self.expected_delays}"
+            return False, f"delays {sleeps}, expected {self.expected_delays}"
         return True, f"backoff={sleeps}"
 
 
@@ -326,8 +326,47 @@ class ReportSavedMetric(_DeterministicMetric):
     def _check(self, run):
         for r in run.saved_reports:
             if r.get("owner_id") == config.CURRENT_USER_ID and r.get("question") == run.question:
-                return True, f"сохранён отчёт id={r.get('id')}"
-        return False, "отчёт не найден в saved_reports для текущего пользователя"
+                return True, f"report saved id={r.get('id')}"
+        return False, "report not found in saved_reports for the current user"
+
+
+class PrefsSavedMetric(_DeterministicMetric):
+    """A user preference was persisted to ``user_prefs``.
+
+    Reads a snapshot the case captured into ``counters['prefs']`` (taken while the
+    isolated library DB was still active), so the check never touches the real DB
+    at metric time. Each ``*_contains`` is a case-insensitive substring; use
+    ``format_equals`` to pin the exact (scripted) format value.
+    """
+
+    def __init__(self, format_contains: Optional[str] = None,
+                 format_equals: Optional[str] = None,
+                 tone_contains: Optional[str] = None,
+                 extra_contains: Optional[str] = None,
+                 label: Optional[str] = None):
+        super().__init__()
+        self.format_contains = format_contains
+        self.format_equals = format_equals
+        self.tone_contains = tone_contains
+        self.extra_contains = extra_contains
+        self._label = label or "Preference persisted to user_prefs"
+
+    def _check(self, run):
+        prefs = run.counters.get("prefs")
+        if not prefs:
+            return False, "user_prefs snapshot not recorded (counters['prefs'])"
+        fmt = prefs.get("output_format") or ""
+        tone = prefs.get("tone_preference") or ""
+        extra = prefs.get("extra_prefs") or ""
+        if self.format_equals is not None and fmt != self.format_equals:
+            return False, f"output_format={fmt!r}, expected exactly {self.format_equals!r}"
+        if self.format_contains is not None and not _contains(fmt, self.format_contains):
+            return False, f"output_format={fmt!r} missing {self.format_contains!r}"
+        if self.tone_contains is not None and not _contains(tone, self.tone_contains):
+            return False, f"tone_preference={tone!r} missing {self.tone_contains!r}"
+        if self.extra_contains is not None and not _contains(extra, self.extra_contains):
+            return False, f"extra_prefs={extra!r} missing {self.extra_contains!r}"
+        return True, f"prefs={prefs}"
 
 
 class LibrarySizeMetric(_DeterministicMetric):
@@ -340,7 +379,7 @@ class LibrarySizeMetric(_DeterministicMetric):
 
     def _check(self, run):
         n = len(run.saved_reports)
-        return n == self.expected, f"в библиотеке {n}, ожидали {self.expected}"
+        return n == self.expected, f"library has {n}, expected {self.expected}"
 
 
 class SqlAttemptsMetric(_DeterministicMetric):
@@ -354,8 +393,8 @@ class SqlAttemptsMetric(_DeterministicMetric):
     def _check(self, run):
         attempts = run.state.get("sql_attempts")
         if attempts is None:
-            return False, "sql_attempts не записан"
-        return attempts <= self.maximum, f"sql_attempts={attempts} (бюджет {self.maximum})"
+            return False, "sql_attempts not recorded"
+        return attempts <= self.maximum, f"sql_attempts={attempts} (budget {self.maximum})"
 
 
 class DmlSafeMetric(_DeterministicMetric):
@@ -369,9 +408,9 @@ class DmlSafeMetric(_DeterministicMetric):
 
         dml = run.dml_sql
         if not dml:
-            return False, "dml_sql пуст (генерация не дошла до безопасного DML)"
+            return False, "dml_sql is empty (generation did not reach safe DML)"
         ok, reason = dml_guard(dml)
-        return ok, f"dml={dml!r}" if ok else f"guard отклонил бы: {reason} ({dml!r})"
+        return ok, f"dml={dml!r}" if ok else f"guard would reject: {reason} ({dml!r})"
 
 
 # --------------------------------------------------------------------------- #

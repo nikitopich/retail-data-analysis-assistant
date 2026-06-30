@@ -67,12 +67,12 @@ def _clean(value) -> Optional[str]:
 def _confirmation(output_format: Optional[str], tone: Optional[str], extra: Optional[str]) -> str:
     parts = []
     if output_format:
-        parts.append(f"формат — {output_format}")
+        parts.append(f"format — {output_format}")
     if tone:
-        parts.append(f"тон — {tone}")
+        parts.append(f"tone — {tone}")
     if extra:
-        parts.append(f"ещё — {extra}")
-    return "✓ Запомнил ваши предпочтения: " + "; ".join(parts) + "."
+        parts.append(f"also — {extra}")
+    return "✓ Saved your preferences: " + "; ".join(parts) + "."
 
 
 def prefs_agent(state: AgentState) -> dict:
@@ -121,7 +121,7 @@ def prefs_agent(state: AgentState) -> dict:
         new_report = revise(orig_question, rows_markdown, prev_report, message, prefs)
     except Exception:
         # The preference is saved; only the immediate re-render failed.
-        return {"final_message": confirmation + "\n\n_(применю к следующему отчёту)_"}
+        return {"final_message": confirmation + "\n\n_(will apply to your next report)_"}
 
     return {
         "report_md": new_report,

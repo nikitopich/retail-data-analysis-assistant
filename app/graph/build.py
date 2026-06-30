@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.prefs_agent import prefs_agent
 from app.agents.report_agent import report_agent
 from app.agents.reports_gate import reports_gate
 from app.agents.sql_agent import sql_agent
@@ -18,10 +19,12 @@ def _route_supervisor(state: AgentState) -> str:
 def _route_after_sql(state: AgentState) -> str:
     if state.get("final_message"):
         return "end"
-    # Destructive ops and saved-reports reads both go through the gate (which
-    # branches on the SQL verb: DML -> confirm, SELECT -> owner-scoped read).
-    if state.get("intent") == "destructive" or state.get("data_source") == "reports":
+    if state.get("intent") == "destructive":
         return "reports_gate"
+    # Schema/meta answers (direct LLM prose, no SQL ran) are already complete —
+    # sending them to report_agent causes a 504 on long structural descriptions.
+    if state.get("data_source") == "schema":
+        return "end"
     return "report_agent"
 
 
@@ -33,6 +36,7 @@ def build_graph(checkpointer):
     graph.add_node("sql_agent", sql_agent)
     graph.add_node("report_agent", report_agent)
     graph.add_node("reports_gate", reports_gate)
+    graph.add_node("prefs_agent", prefs_agent)
 
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges(
@@ -42,6 +46,7 @@ def build_graph(checkpointer):
             "query": "sql_agent",
             "destructive": "sql_agent",
             "regenerate": "report_agent",
+            "set_preference": "prefs_agent",
             "other": END,
         },
     )
@@ -52,5 +57,6 @@ def build_graph(checkpointer):
     )
     graph.add_edge("report_agent", END)
     graph.add_edge("reports_gate", END)
+    graph.add_edge("prefs_agent", END)
 
     return graph.compile(checkpointer=checkpointer)

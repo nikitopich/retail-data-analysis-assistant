@@ -74,7 +74,7 @@ def test_resume_loop_eof_sends_no(monkeypatch):
     app = _FakeApp(final={"final_message": "done"})
     result = cli._resume_loop(app, _interrupt_result(), {"configurable": {}})
     assert result == {"final_message": "done"}
-    assert app.resumed_with == "нет"
+    assert app.resumed_with == "no"
 
 
 def test_resume_loop_noop_without_interrupt():

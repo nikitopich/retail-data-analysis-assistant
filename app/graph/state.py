@@ -10,7 +10,7 @@ class AgentState(TypedDict, total=False):
     debug: bool
     # Flow intent (thin supervisor): the data-source decision for `query` is made
     # downstream by the SQL agent, not here (see app/agents/sql_agent.py).
-    intent: Literal["query", "destructive", "regenerate", "other"]
+    intent: Literal["query", "destructive", "regenerate", "set_preference", "other"]
 
     # SQL agent (BQ analytical path)
     schema_text: str
@@ -33,6 +33,9 @@ class AgentState(TypedDict, total=False):
     preview_sql: Optional[str]
     preview_rows: Optional[List[dict]]
     confirmed: Optional[bool]
+
+    # deferred trio capture: set by report_agent, flushed by supervisor or CLI
+    pending_trio: Optional[dict]
 
     # output to user
     final_message: str

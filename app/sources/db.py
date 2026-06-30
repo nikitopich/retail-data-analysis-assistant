@@ -8,7 +8,7 @@ from typing import Optional
 from app import config
 
 DDL = """
--- Библиотека сохранённых отчётов (ядро High-Stakes Oversight)
+-- Saved reports library (core High-Stakes Oversight)
 CREATE TABLE IF NOT EXISTS saved_reports (
     id                  TEXT PRIMARY KEY,
     owner_id            TEXT NOT NULL,
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS saved_reports (
 CREATE INDEX IF NOT EXISTS idx_saved_reports_owner   ON saved_reports(owner_id);
 CREATE INDEX IF NOT EXISTS idx_saved_reports_created ON saved_reports(created_at);
 
--- Сырые тройки question->sql->report (write-only capture)
+-- Raw question->sql->report triples (write-only capture)
 CREATE TABLE IF NOT EXISTS staged_trios (
     id          TEXT PRIMARY KEY,
     report_id   TEXT NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS staged_trios (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Golden Bucket (схема определена; заполнение/ретривинг вне scope прототипа)
+-- Golden Bucket (schema defined; population/retrieval out of prototype scope)
 CREATE TABLE IF NOT EXISTS trios (
     id                 TEXT PRIMARY KEY,
     question           TEXT NOT NULL,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS trios (
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Предпочтения пользователя (схема определена; управление через диалог вне scope)
+-- User preferences (schema defined; management via dialogue out of scope)
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id         TEXT PRIMARY KEY,
     output_format   TEXT NOT NULL DEFAULT 'table',

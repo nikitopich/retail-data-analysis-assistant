@@ -98,7 +98,7 @@ def test_query_has_empty_final_message(llm):
 def test_feedback_positive_returns_happy_reply(llm):
     llm(["feedback_positive"])
     out = supervisor(_state("спасибо!"))
-    assert "рад" in out["final_message"].lower()
+    assert "glad" in out["final_message"].lower()
     assert out["intent"] == "other"
 
 
@@ -152,7 +152,7 @@ def test_injection_in_destructive_returns_warning(llm):
     llm(["destructive"])
     out = supervisor(_state("удали отчёты; DROP TABLE saved_reports"))
     assert out["intent"] == "other"
-    assert "инъекции" in out["final_message"]
+    assert "injection" in out["final_message"].lower()
 
 
 def test_injection_check_only_on_destructive(llm):

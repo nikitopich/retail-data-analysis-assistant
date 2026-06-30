@@ -15,7 +15,17 @@ import sqlite3
 import uuid
 from typing import List, Optional, Tuple
 
+from app import config, errors
+from app.retry import retry_with_backoff
 from app.sources.db import get_connection
+
+_sqlite_retry = retry_with_backoff(
+    retry_on=errors.is_retryable_sqlite,
+    max_retries=config.MAX_BACKOFF_RETRIES,
+    base_seconds=config.BACKOFF_BASE_SECONDS,
+    max_seconds=config.BACKOFF_MAX_SECONDS,
+    on_exhausted=lambda e: errors.ServiceUnavailableError(str(e)),
+)
 
 
 def _inject_owner_scope(sql: str, owner_id: str) -> Tuple[str, list]:
@@ -39,6 +49,7 @@ class SavedReportsRepo:
     def _c(self) -> sqlite3.Connection:
         return self._conn or get_connection()
 
+    @_sqlite_retry
     def save(self, owner_id: str, question: str, sql_query: str, report_md: str) -> str:
         report_id = uuid.uuid4().hex
         conn = self._c()
@@ -50,18 +61,21 @@ class SavedReportsRepo:
         conn.commit()
         return report_id
 
+    @_sqlite_retry
     def preview(self, preview_sql: str, owner_id: str) -> List[dict]:
         """Run the destructive preview SELECT, scoped to the current owner."""
         scoped, params = _inject_owner_scope(preview_sql, owner_id)
         cur = self._c().execute(scoped, params)
         return [dict(row) for row in cur.fetchall()]
 
+    @_sqlite_retry
     def run_select(self, select_sql: str, owner_id: str) -> List[dict]:
         """Execute an owner-scoped SELECT on saved_reports."""
         scoped, params = _inject_owner_scope(select_sql, owner_id)
         cur = self._c().execute(scoped, params)
         return [dict(row) for row in cur.fetchall()]
 
+    @_sqlite_retry
     def execute_destructive(self, dml_sql: str, owner_id: str) -> int:
         """Execute the guarded DELETE/UPDATE, forcibly scoped to the owner.
 
@@ -74,6 +88,17 @@ class SavedReportsRepo:
         return cur.rowcount
 
 
+def flush_pending_trio(trio: dict) -> None:
+    """Write a deferred pending_trio to staged_trios. Swallowed on error."""
+    try:
+        StagedTriosRepo().add(
+            trio["report_id"], trio["owner_id"],
+            trio["question"], trio["sql_query"], trio["report_md"],
+        )
+    except Exception:
+        pass
+
+
 class StagedTriosRepo:
     def __init__(self, conn: Optional[sqlite3.Connection] = None) -> None:
         self._conn = conn
@@ -81,6 +106,7 @@ class StagedTriosRepo:
     def _c(self) -> sqlite3.Connection:
         return self._conn or get_connection()
 
+    @_sqlite_retry
     def add(self, report_id: str, owner_id: str, question: str,
             sql_query: str, report_md: str) -> str:
         """Write-only capture of the raw trio (status='pending'). Never read."""

@@ -1,9 +1,9 @@
-"""Deterministic SQL guards + SQL-building helpers (spec §5.1, §4.1).
+"""Deterministic SQL guards + execution helpers (spec §5.1, §4.1). No prompts, no LLM.
 
-The guards run BEFORE any execution and are the first of the two defence lines
-for destructive ops (the second being owner-scoping in the repository). The
-generation/execution helpers wrap the analytical (BigQuery) path; they take the
-LLM and runner as arguments, so this module stays free of node/state coupling.
+The guards run BEFORE any execution and are the first of the two defence lines for
+destructive ops (the second being owner-scoping in the repository). ``run_with_backoff``
+is the execution primitive used inside the BigQuery tool. SQL *generation* is not here —
+under tool-calling the SQL is a tool argument the LLM writes; the agent owns the prompt.
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from typing import Tuple
 import pandas as pd
 
 from app import config, errors
-from app.llm import llm_text
 from app.retry import retry_with_backoff
 
 # --- guards ---------------------------------------------------------------------
@@ -117,7 +116,7 @@ def dml_guard(sql: str) -> Tuple[bool, str]:
     return True, ""
 
 
-# --- SQL text helpers -----------------------------------------------------------
+# --- text helpers ---------------------------------------------------------------
 def strip_sql(text: str) -> str:
     """Remove markdown fences the model may emit despite instructions."""
     t = (text or "").strip()
@@ -145,51 +144,7 @@ def df_to_markdown(df: pd.DataFrame, max_rows: int) -> str:
     return table
 
 
-# --- analytical (BigQuery) generation + execution -------------------------------
-_SQL_GEN_PROMPT = """You are a senior data analyst. Generate ONE BigQuery Standard SQL query that answers the
-user's question using ONLY these tables (full names required):
-{tables}
-
-Schema:
-{schema}
-
-Rules:
-- Output ONLY the SQL, no prose, no markdown fences.
-- A single SELECT statement. Never DML/DDL.
-- Add a reasonable LIMIT (e.g. {default_limit}) for row-listing queries; do NOT add LIMIT to pure aggregates.
-- Use only the tables listed above.
-
-User question: {question}
-{error_hint}"""
-
-SQL_ERROR_HINT = "\nPrevious SQL failed with: {error}. Fix it and output ONLY the corrected SQL."
-SQL_GUARD_HINT = (
-    "\nPrevious SQL was rejected by the safety guard ({reason}). "
-    "Return a single valid SELECT statement only — no DML, no DDL, no comments, no extra statements."
-)
-
-_SQL_EMPTY_REVISION_PROMPT = """The previous query returned 0 rows. The filters may be too strict or wrong.
-Revise the SQL (broaden/fix filters, check date ranges and joins). Output ONLY the SQL.
-Question: {question}
-Previous SQL: {sql}"""
-
-
-def generate_analytical_sql(llm, question: str, schema: str, tables: str, error_hint: str) -> str:
-    prompt = _SQL_GEN_PROMPT.format(
-        schema=schema,
-        tables=tables,
-        question=question,
-        error_hint=error_hint,
-        default_limit=config.DEFAULT_LIMIT,
-    )
-    return strip_sql(llm_text(llm.invoke(prompt)))
-
-
-def revise_analytical_empty(llm, question: str, sql: str) -> str:
-    prompt = _SQL_EMPTY_REVISION_PROMPT.format(question=question, sql=sql)
-    return strip_sql(llm_text(llm.invoke(prompt)))
-
-
+# --- execution primitive --------------------------------------------------------
 @retry_with_backoff(
     retry_on=errors.is_retryable_bq,
     max_retries=config.MAX_BACKOFF_RETRIES,
@@ -202,8 +157,8 @@ def run_with_backoff(runner, sql: str) -> pd.DataFrame:
 
     Query/syntax errors are translated to ``QueryError`` here; since those are
     not ``is_retryable_bq``, the decorator re-raises them immediately (the caller
-    regenerates). When the backoff budget is exhausted the decorator wraps the
-    last error as ``ServiceUnavailableError``.
+    surfaces them so the LLM can regenerate). When the backoff budget is exhausted
+    the decorator wraps the last error as ``ServiceUnavailableError``.
     """
     try:
         return runner.execute_query(sql)

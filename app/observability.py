@@ -44,6 +44,11 @@ def init_tracing(
             url = PHOENIX_URL
 
         LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+        # Silence all OTel noise (encode errors for surrogates, batch exporter
+        # failures, ClientDisconnect) and google-auth warnings — tracing
+        # failures must never surface as noise in the user-facing CLI output.
+        for _name in ("opentelemetry", "google.auth"):
+            logging.getLogger(_name).setLevel(logging.CRITICAL)
         return url
     except Exception as e:  # pragma: no cover - depends on local env
         logging.warning(f"Phoenix tracing disabled: {e}")

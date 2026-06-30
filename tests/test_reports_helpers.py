@@ -84,7 +84,7 @@ def test_make_preview_no_where():
 # format_rows
 # --------------------------------------------------------------------------- #
 def test_format_rows_empty():
-    assert format_rows([]) == "Ничего не найдено."
+    assert format_rows([]) == "Nothing found."
 
 
 def test_format_rows_renders_table():

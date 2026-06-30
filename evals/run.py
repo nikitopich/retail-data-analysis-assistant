@@ -1,9 +1,9 @@
 """No-pytest runner: execute cases and print a compact pass/fail summary.
 
-    python -m evals.run                 # все кейсы (live пропускаются без кредов)
-    python -m evals.run --subset faults # только offline fault-кейсы
-    python -m evals.run --subset live   # только live-кейсы (нужны креды)
-    python -m evals.run --quiet         # без подробного вывода DeepEval
+    python -m evals.run                 # all cases (live cases skipped without credentials)
+    python -m evals.run --subset faults # only offline fault cases
+    python -m evals.run --subset live   # only live cases (credentials required)
+    python -m evals.run --quiet         # suppress detailed DeepEval output
 
 Exit code is non-zero if any case FAILed or ERRORed (CI-friendly).
 """
@@ -27,13 +27,13 @@ _STATUS = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️ ", "ERROR": "💥"}
 
 def _run_case(case) -> tuple[str, str]:
     if case.requires_creds and not harness.has_creds():
-        return "SKIP", "нет GOOGLE_API_KEY/GCP_PROJECT"
+        return "SKIP", "GOOGLE_API_KEY/GCP_PROJECT not set"
     try:
         with harness.isolated_db():
             run = case.execute()
         tc = LLMTestCase(
             input=case.question,
-            actual_output=run.final_message or "(пустой ответ)",
+            actual_output=run.final_message or "(empty response)",
             metadata={"run": run, "case_id": case.id},
         )
         assert_test(tc, case.build_metrics(), run_async=False)
@@ -50,7 +50,7 @@ def main() -> int:
     ap.add_argument("--subset", default="all",
                     choices=["all", "live", "acceptance", "faults", "fault", "offline"])
     ap.add_argument("--quiet", action="store_true",
-                    help="подавить подробный вывод DeepEval по каждой метрике")
+                    help="suppress detailed DeepEval output per metric")
     args = ap.parse_args()
 
     if args.quiet:
@@ -69,7 +69,7 @@ def main() -> int:
         results.append((case.id, status, detail))
 
     print("\n" + "=" * 70)
-    print("ИТОГ ПРОГОНА")
+    print("RUN SUMMARY")
     print("=" * 70)
     for cid, status, detail in results:
         print(f"{_STATUS.get(status, '?')} {status:5} {cid:4} {detail}")

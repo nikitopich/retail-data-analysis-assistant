@@ -8,11 +8,21 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from app import config
+from app import config, errors
+from app.retry import retry_with_backoff
 from app.sources.bigquery import get_bq_runner
+
+_bq_retry = retry_with_backoff(
+    retry_on=errors.is_retryable_bq,
+    max_retries=config.MAX_BACKOFF_RETRIES,
+    base_seconds=config.BACKOFF_BASE_SECONDS,
+    max_seconds=config.BACKOFF_MAX_SECONDS,
+    on_exhausted=lambda e: errors.ServiceUnavailableError(str(e)),
+)
 
 
 @lru_cache(maxsize=1)
+@_bq_retry
 def get_bq_tables() -> tuple:
     """Return (cached) the table names in the BigQuery dataset, fetched live."""
     return tuple(get_bq_runner().list_tables())
@@ -24,6 +34,7 @@ def bq_table_list() -> str:
 
 
 @lru_cache(maxsize=1)
+@_bq_retry
 def get_schema_text() -> str:
     runner = get_bq_runner()
     blocks = []

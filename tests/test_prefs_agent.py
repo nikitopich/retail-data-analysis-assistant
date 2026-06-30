@@ -44,7 +44,7 @@ def llm(fake_llm_factory):
 def test_extracts_and_saves(llm, patched_conn):
     llm(['{"output_format": "CSV", "tone": "concise", "extra": null}'])
     out = prefs_agent(_state())
-    assert "Запомнил" in out["final_message"]
+    assert "Saved" in out["final_message"]
     assert "CSV" in out["final_message"]
     row = patched_conn.execute(
         "SELECT output_format, tone_preference FROM user_prefs WHERE user_id = ?",
@@ -74,7 +74,7 @@ def test_rerenders_last_report_when_present(llm, patched_conn):
         last_question="сколько заказов?",
     ))
     assert out["report_md"] == "id,orders\n1,42"
-    assert "Запомнил" in out["final_message"]
+    assert "Saved" in out["final_message"]
     assert "id,orders" in out["final_message"]
     assert out["last_question"] == "сколько заказов?"
     # A pure preference change must NOT create a new saved report.
@@ -86,7 +86,7 @@ def test_rerenders_last_report_when_present(llm, patched_conn):
 def test_no_previous_report_confirmation_only(llm, patched_conn):
     fake = llm(['{"output_format": "CSV", "tone": null, "extra": null}'])
     out = prefs_agent(_state())
-    assert "Запомнил" in out["final_message"]
+    assert "Saved" in out["final_message"]
     assert "report_md" not in out
     assert len(fake.calls) == 1  # no re-render
 

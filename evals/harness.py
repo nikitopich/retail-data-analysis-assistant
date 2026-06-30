@@ -172,7 +172,7 @@ def seed_report(question: str, *, owner_id: Optional[str] = None,
 
     Used to set up destructive cases deterministically (instead of running
     A1–A3 first). ``created_at`` defaults to ``datetime('now')`` so the row
-    matches "за сегодня" predicates.
+    matches "today" predicates.
     """
     from app.sources import db
 
@@ -213,7 +213,7 @@ def drive(question: str, *, confirm: Optional[str] = None, debug: bool = False,
     """Run ``question`` through the compiled graph; drive the confirm loop.
 
     ``confirm`` is the answer fed to a destructive ``interrupt()`` (e.g. "да" /
-    "нет"); ``None`` means "no confirmation provided" which the gate treats as a
+    "no"); ``None`` means "no confirmation provided" which the gate treats as a
     cancel — exactly like the CLI's AFK default.
     """
     app = build_graph(_MemorySaver())
@@ -321,12 +321,14 @@ def fake_llms(*, supervisor: FakeLLM, sql: Optional[FakeLLM] = None,
         # back to the supervisor double.
         return mapping.get(model, supervisor)
 
+    import app.agents.prefs_agent as prefs_mod
     import app.agents.report_agent as rep_mod
     import app.agents.reports_gate as gate_mod
     import app.agents.sql_agent as sql_mod
     import app.agents.supervisor as sup_mod
 
-    targets = [sup_mod, sql_mod, rep_mod, gate_mod]
+    # prefs_agent extracts via SUPERVISOR_MODEL, so it shares the supervisor double.
+    targets = [sup_mod, sql_mod, rep_mod, gate_mod, prefs_mod]
     originals = [(m, getattr(m, "get_llm", None)) for m in targets]
     for m in targets:
         m.get_llm = _fake_get_llm  # type: ignore[assignment]
